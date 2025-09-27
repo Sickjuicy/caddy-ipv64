@@ -26,7 +26,34 @@ go.work.sum
 
 # env file
 .env
+.env.*
 
 # Editor/IDE
-# .idea/
-# .vscode/
+.idea/
+.vscode/
+
+# OS-specific
+.DS_Store
+Thumbs.db
+
+# Logs & temp files
+*.log
+*.tmp
+tmp/
+temp/
+
+# Build outputs
+/caddy
+/caddy.exe
+/caddy_*
+/bin/
+/dist/
+/build/
+/out/
+
+# caddy test files
+/caddy-test/
+
+# Optional: local Caddy runtime data if created inside repo (usually outside)
+autosave.json
+.caddy/
