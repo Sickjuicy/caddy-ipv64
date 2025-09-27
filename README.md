@@ -1,34 +1,44 @@
 # caddy-ipv64
 
-An ACME DNS-01 provider for Caddy v2 that integrates with ipv64.net.
+An ACME DNS-01 provider for Caddy v2 integrated with ipv64.net. Includes:
 
-Provides Caddyfile and JSON configuration support and lets you customize DNS resolvers and timing behavior.
+- dns.providers.ipv64 – DNS-01 provider (creates/deletes TXT via API)
+- tls.issuance.acme_defaults – issuer wrapper with safer DNS propagation defaults
+- http.handlers.acme_ipv64 – optional DynDNS update handler (use only if needed)
 
-## Installation
+## Installation / Build
 
-Build a Caddy binary with this module using xcaddy:
+Build with xcaddy (recommended: Caddy v2.10.x):
 
 ```
-xcaddy build v2.8.0 --with github.com/Sickjuicy/caddy-ipv64@latest
+xcaddy build v2.10.2 --with github.com/Sickjuicy/caddy-ipv64@latest
 ```
 
-This produces a Caddy binary that includes the `dns.providers.ipv64` module.
+Verify modules are present:
 
-## Quick start
+```
+caddy list-modules | grep -E "ipv64|acme_defaults"
+```
 
-1) Build a Caddy with this module:
-```
-xcaddy build v2.8.0 --with github.com/Sickjuicy/caddy-ipv64@latest
-```
-2) Provide your ipv64 API token (e.g., via environment):
+Expected to include at least:
+
+- dns.providers.ipv64
+- tls.issuance.acme_defaults
+- http.handlers.acme_ipv64 (if you use it)
+
+## Quick Start
+
+1) Set your token as an environment variable:
+
 ```bash
 export IPV64_API_TOKEN='YOUR_TOKEN'
 ```
-3) Choose one configuration style below (A or B).
 
-Note:
-- Start with Let’s Encrypt staging while testing.
-- Domain autodetection: You can usually omit `domain`. If the base zone has two labels (e.g., `ipv64.de`, `ipv64.net`, `any64.de`, ...), the provider infers your managed subzone from the ACME record name.
+2) Choose one of the configurations below (A or B).
+
+Notes:
+- When testing, prefer Let’s Encrypt staging first.
+- Domain auto-detection: in many cases you can omit `domain`. For base zones with two labels (e.g., `ipv64.de`, `ipv64.net`, `any64.de`), the managed subzone is inferred from the ACME record name.
 
 ## Examples
 
@@ -44,7 +54,7 @@ Put the provider in the global options block using `acme_dns`. Applies to all si
   acme_dns ipv64 {
     api_token {env.IPV64_API_TOKEN}
     # optional:
-    # resolver ns1.ipv64.de ns2.ipv64.de
+    # resolver ns1.ipv64.net ns2.ipv64.net
     # timeout_seconds 15
     # max_retries 5
     # initial_backoff_ms 400
@@ -77,7 +87,7 @@ example.com {
 </details>
 
 <details>
-  <summary><strong>Optional: wildcard and SAN</strong></summary>
+  <summary><strong>Optional: Wildcard and SAN</strong></summary>
 
 ```caddyfile
 # Wildcard + apex in one site (DNS-01 required for wildcard)
@@ -96,7 +106,7 @@ example.com {
 <details>
   <summary><strong>Recommended: use acme_defaults issuer (safer DNS-01 defaults)</strong></summary>
 
-The wrapper issuer `acme_defaults` sets better defaults for DNS propagation when using DNS-01:
+The `acme_defaults` wrapper issuer sets better defaults for DNS propagation with DNS-01:
 
 - propagation_delay: 30s
 - propagation_timeout: 4m
@@ -167,7 +177,7 @@ JSON equivalent (note the issuer module name):
                     "provider": {
                       "name": "ipv64",
                       "api_token": "{env.IPV64_API_TOKEN}",
-                      "resolver": ["ns1.ipv64.de", "ns2.ipv64.de"],
+                      "resolver": ["ns1.ipv64.net", "ns2.ipv64.net"],
                       "timeout_seconds": 15,
                       "max_retries": 5,
                       "initial_backoff_ms": 400,
@@ -189,15 +199,15 @@ JSON equivalent (note the issuer module name):
 
 ## Environment variables
 
-- IPV64_API_TOKEN (required): Bearer token for the ipv64 API.
+- IPV64_API_TOKEN (required): token for the ipv64 API.
 
-Set it in your environment before starting Caddy. For example (bash/zsh):
+Set the variable before starting Caddy. Example (bash/zsh):
 
 ```bash
 export IPV64_API_TOKEN='YOUR_TOKEN'
 ```
 
-You can also use a .env file if your process manager or container loads it into the environment.
+With systemd, you can use an EnvironmentFile.
 
 ## Options
 
@@ -213,22 +223,22 @@ All options map 1:1 between Caddyfile and JSON:
 
 ## Tips
 
-- If you see “No TXT record found during secondary validation”, increase `delete_delay_seconds` or use authoritative ipv64 resolvers first.
-- Use Let’s Encrypt staging while testing to avoid rate limits.
+- If you see “No TXT record found during secondary validation”, increase `delete_delay_seconds` and/or prioritize authoritative ipv64 resolvers.
+- For testing, use Let’s Encrypt staging to avoid rate limits.
 
 ## Troubleshooting
 
 - ipv64 API 400 "domain not found":
-	- Ensure the subzone actually exists in your ipv64 account.
-	- With autodetection, the provider infers the subzone from your hostname; double-check logs for `cfg_domain`.
-	- You can always override by explicitly setting `domain` in the Caddyfile.
+  - Ensure the subzone exists in your ipv64 account.
+  - With auto-detection, the provider infers the subzone from your hostname; check logs for `cfg_domain`.
+  - You can always override by explicitly setting `domain` in the Caddyfile.
 - "api_token must be set":
-	- Set `IPV64_API_TOKEN` in the environment or specify `api_token` in the Caddyfile/JSON config.
+  - Set `IPV64_API_TOKEN` in the environment or specify `api_token` in the Caddyfile/JSON config.
 
 ## References & internals
 
 - ipv64.net: https://ipv64.net — DNS hosting service used by this provider.
-- ipv64 API: this module talks to https://ipv64.net/api.php using a Bearer token to create and delete TXT records for ACME DNS-01.
-- Caddy/CertMagic: issuance is handled by Caddy via CertMagic (https://github.com/caddyserver/certmagic) using the DNS challenge.
-- libdns: the provider implements the libdns-style interfaces (AppendRecords/DeleteRecords) expected by Caddy’s DNS plugin system.
-- Resolvers: by default, ipv64 nameservers (e.g., ns1.ipv64.de, ns2.ipv64.de) are preferred for propagation checks, with public resolvers as fallbacks.
+- ipv64 API: this module uses https://ipv64.net/api.php with a bearer token to create/delete TXT records for ACME DNS-01.
+- Caddy/CertMagic: issuance via CertMagic (https://github.com/caddyserver/certmagic) using the DNS challenge.
+- libdns: the provider implements the libdns interfaces (AppendRecords/DeleteRecords) expected by Caddy’s DNS plugin bridge.
+- Resolvers: by default, authoritative ipv64 nameservers (e.g., ns1.ipv64.net, ns2.ipv64.net) are prioritized, then public resolvers.

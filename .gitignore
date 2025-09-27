@@ -53,6 +53,7 @@ temp/
 
 # caddy test files
 /caddy-test/
+/cmd/
 
 # Local main wrapper (keep out of git)
 /cmd/caddy-ipv64/
