@@ -6,6 +6,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"os"
 	"strconv"
 	"strings"
 	"time"
@@ -55,6 +56,12 @@ func (p *DnsIPv64Provider) Provision(ctx caddy.Context) error {
 		// Set to 0 explicitly in config to disable the delay.
 		p.DeleteDelaySeconds = 20
 	}
+	// Global fallback for token via environment if not provided per-site
+	if p.Token == "" {
+		if v := os.Getenv("IPV64_API_TOKEN"); v != "" {
+			p.Token = v
+		}
+	}
 	// Default resolvers: ipv64 nameservers first, then public fallbacks (Cloudflare, Google, Quad9)
 	if len(p.Resolver) == 0 {
 		p.Resolver = []string{
@@ -70,11 +77,9 @@ func (p *DnsIPv64Provider) Provision(ctx caddy.Context) error {
 
 func (p *DnsIPv64Provider) Validate() error {
 	if p.Token == "" {
-		return fmt.Errorf("api_token must be set")
+		return fmt.Errorf("api_token must be set (or set IPV64_API_TOKEN in environment)")
 	}
-	if p.Domain == "" {
-		return fmt.Errorf("domain must be set")
-	}
+	// Domain is optional; if missing, it will be derived from the zone provided by CertMagic/libdns.
 	return nil
 }
 
@@ -90,13 +95,12 @@ func (p *DnsIPv64Provider) AppendRecords(ctx context.Context, zone string, recs 
 	logger := caddy.Log().Named("dns.providers.ipv64")
 	for _, r := range recs {
 		form := url.Values{}
-		// Always operate within the configured domain/zone
+		// Build full FQDN from libdns parts using provided zone
+		z := strings.TrimSuffix(zone, ".")
 		cfgDomain := strings.TrimSuffix(p.Domain, ".")
-		// Build full FQDN from libdns parts, then reduce to prefix relative to cfgDomain
-		fullName := strings.TrimSuffix(cfgDomain, ".")
+		fullName := z
 		if r.Name != "" && r.Name != "@" {
 			// libdns names are relative to the provided zone; compute FQDN using input zone
-			z := strings.TrimSuffix(zone, ".")
 			if z != "" {
 				fullName = strings.TrimSuffix(r.Name, ".") + "." + z
 			} else {
@@ -104,10 +108,25 @@ func (p *DnsIPv64Provider) AppendRecords(ctx context.Context, zone string, recs 
 			}
 		} else {
 			// apex record name
-			z := strings.TrimSuffix(zone, ".")
 			if z != "" {
 				fullName = z
 			}
+		}
+		// Determine the domain/zone: prefer configured domain; otherwise derive from libdns zone,
+		// with special handling for ipv64-managed subzones (e.g., sickcloud.ipv64.de)
+		if cfgDomain == "" {
+			cfgDomain = z
+			// If base zone has exactly two labels (e.g., any64.de, ipv64.net, ...),
+			// infer managed subzone from the full FQDN.
+			zLabels := strings.Split(strings.ToLower(z), ".")
+			if len(zLabels) == 2 {
+				if d := deriveIPv64Domain(fullName, z); d != "" {
+					cfgDomain = d
+				}
+			}
+		}
+		if cfgDomain == "" {
+			return created, fmt.Errorf("unable to determine domain: set 'domain' or ensure zone is provided")
 		}
 		prefix := relativePrefix(fullName, cfgDomain)
 
@@ -200,21 +219,33 @@ func (p *DnsIPv64Provider) DeleteRecords(ctx context.Context, zone string, recs 
 
 		for _, r := range recsCopy {
 			form := url.Values{}
-			cfgDomain := strings.TrimSuffix(p.Domain, ".")
 			// Build full name relative to provided zone and reduce to cfgDomain
-			fullName := strings.TrimSuffix(cfgDomain, ".")
+			z := strings.TrimSuffix(zoneCopy, ".")
+			cfgDomain := strings.TrimSuffix(p.Domain, ".")
+			fullName := z
 			if r.Name != "" && r.Name != "@" {
-				z := strings.TrimSuffix(zoneCopy, ".")
 				if z != "" {
 					fullName = strings.TrimSuffix(r.Name, ".") + "." + z
 				} else {
 					fullName = strings.TrimSuffix(r.Name, ".")
 				}
 			} else {
-				z := strings.TrimSuffix(zoneCopy, ".")
 				if z != "" {
 					fullName = z
 				}
+			}
+			if cfgDomain == "" {
+				cfgDomain = z
+				zLabels := strings.Split(strings.ToLower(z), ".")
+				if len(zLabels) == 2 {
+					if d := deriveIPv64Domain(fullName, z); d != "" {
+						cfgDomain = d
+					}
+				}
+			}
+			if cfgDomain == "" {
+				logger.Warn("unable to determine domain for delete; skipping record")
+				continue
 			}
 			prefix := relativePrefix(fullName, cfgDomain)
 
@@ -346,6 +377,48 @@ func relativePrefix(fullName, domain string) string {
 	}
 	// If unrelated, fall back to original name (best effort)
 	return f
+}
+
+// deriveIPv64Domain tries to infer the managed ipv64 subzone from the full FQDN and the base zone.
+// Example: fullName=_acme-challenge.test.sickcloud.ipv64.de, zone=ipv64.de -> returns sickcloud.ipv64.de
+// It removes ACME-specific labels and then takes the rightmost non-ACME label directly left of the base zone.
+func deriveIPv64Domain(fullName, zone string) string {
+	f := strings.TrimSuffix(strings.ToLower(fullName), ".")
+	z := strings.TrimSuffix(strings.ToLower(zone), ".")
+	if f == "" || z == "" {
+		return ""
+	}
+	fLabels := strings.Split(f, ".")
+	zLabels := strings.Split(z, ".")
+	if len(fLabels) <= len(zLabels) {
+		return ""
+	}
+	// Ensure fullName ends with zone labels
+	for i := 1; i <= len(zLabels); i++ {
+		if fLabels[len(fLabels)-i] != zLabels[len(zLabels)-i] {
+			return ""
+		}
+	}
+	// Labels left of the base zone
+	left := fLabels[:len(fLabels)-len(zLabels)]
+	// Drop ACME challenge label(s) from the left side
+	// Common forms: _acme-challenge, _acme-challenge.<something>
+	for len(left) > 0 {
+		if left[0] == "_acme-challenge" || strings.HasPrefix(left[0], "_acme-challenge-") {
+			left = left[1:]
+		} else {
+			break
+		}
+	}
+	if len(left) == 0 {
+		return ""
+	}
+	// Take the label closest to the base zone as the subzone name
+	sub := left[len(left)-1]
+	if sub == "" {
+		return ""
+	}
+	return sub + "." + z
 }
 
 // GetRecords is optional for ACME and returns empty result (not required for issuance).

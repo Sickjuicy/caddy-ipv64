@@ -54,6 +54,9 @@ temp/
 # caddy test files
 /caddy-test/
 
+# Local main wrapper (keep out of git)
+/cmd/caddy-ipv64/
+
 # Optional: local Caddy runtime data if created inside repo (usually outside)
 autosave.json
 .caddy/
