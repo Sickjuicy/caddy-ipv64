@@ -2,11 +2,11 @@ package caddyipv64
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
-	"net"
+	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"strings"
 	"time"
@@ -25,9 +25,12 @@ type Provider struct {
 	TimeoutSeconds       int      `json:"timeout_seconds,omitempty"`
 	MaxRetries           int      `json:"max_retries,omitempty"`
 	InitialBackoffMillis int      `json:"initial_backoff_ms,omitempty"`
+	CreateDelaySeconds   int      `json:"create_delay_seconds,omitempty"`
 	DeleteDelaySeconds   int      `json:"delete_delay_seconds,omitempty"`
 
-	logger *zap.Logger
+	logger        *zap.Logger
+	cachedDomains []string // Cache for available domains
+	domainsCached bool     // Flag whether domains have been retrieved
 }
 
 // Note: We implement AppendRecords/DeleteRecords required by Caddy's libdns bridge.
@@ -48,13 +51,16 @@ func (p *Provider) Provision(ctx caddy.Context) error {
 		p.Token = os.Getenv("IPV64_API_TOKEN")
 	}
 	if p.TimeoutSeconds <= 0 {
-		p.TimeoutSeconds = 10
+		p.TimeoutSeconds = 5
 	}
 	if p.MaxRetries <= 0 {
-		p.MaxRetries = 5
+		p.MaxRetries = 3
 	}
 	if p.InitialBackoffMillis <= 0 {
 		p.InitialBackoffMillis = 400
+	}
+	if p.CreateDelaySeconds <= 0 {
+		p.CreateDelaySeconds = 25
 	}
 	if p.DeleteDelaySeconds < 0 {
 		p.DeleteDelaySeconds = 0
@@ -111,20 +117,39 @@ func (p *Provider) AppendRecords(ctx context.Context, zone string, recs []libdns
 			return appended, fmt.Errorf("cannot derive managed zone for %s in zone %s", fqdn, zone)
 		}
 		// Compute relative prefix under managed zone
-		prefix := strings.TrimSuffix(strings.TrimSuffix(fqdn, "."+managed), ".")
-		if prefix == managed {
+		// Remove the managed zone and trailing dot from fqdn
+		fqdnClean := strings.TrimSuffix(fqdn, ".")
+		managedClean := strings.TrimSuffix(managed, ".")
+
+		var prefix string
+		if fqdnClean == managedClean {
 			prefix = "@"
+		} else if strings.HasSuffix(fqdnClean, "."+managedClean) {
+			prefix = strings.TrimSuffix(fqdnClean, "."+managedClean)
+		} else {
+			// Fallback: use the first part before the first dot
+			parts := strings.Split(fqdnClean, ".")
+			prefix = parts[0]
 		}
 
-		reqBody := map[string]string{
-			"domain":  managed,
-			"type":    "TXT",
-			"name":    prefix,
-			"content": value,
+		if p.logger != nil {
+			p.logger.Debug("ipv64: DNS record details",
+				zap.String("fqdn", fqdn),
+				zap.String("zone", zone),
+				zap.String("managed", managed),
+				zap.String("prefix", prefix),
+				zap.String("value", value))
 		}
-		enc, _ := json.Marshal(reqBody)
-		url := "https://ipv64.net/api/dns/add"
-		err := p.doWithRetry(ctx, client, http.MethodPost, url, enc)
+
+		// Use form-urlencoded format as per API documentation
+		formData := url.Values{}
+		formData.Set("add_record", managed)
+		formData.Set("praefix", prefix)
+		formData.Set("type", "TXT")
+		formData.Set("content", value)
+
+		apiURL := "https://ipv64.net/api"
+		err := p.doWithRetryForm(ctx, client, http.MethodPost, apiURL, formData)
 		if err != nil {
 			return appended, err
 		}
@@ -133,6 +158,20 @@ func (p *Provider) AppendRecords(ctx context.Context, zone string, recs []libdns
 			p.logger.Debug("ipv64: appended TXT", zap.String("fqdn", fqdn), zap.String("zone", managed))
 		}
 	}
+
+	// Wait for DNS propagation after creating records
+	if p.CreateDelaySeconds > 0 {
+		if p.logger != nil {
+			p.logger.Debug("ipv64: waiting for DNS propagation after record creation",
+				zap.Int("delay_seconds", p.CreateDelaySeconds))
+		}
+		select {
+		case <-time.After(time.Duration(p.CreateDelaySeconds) * time.Second):
+		case <-ctx.Done():
+			return appended, ctx.Err()
+		}
+	}
+
 	return appended, nil
 }
 
@@ -157,22 +196,46 @@ func (p *Provider) DeleteRecords(ctx context.Context, zone string, recs []libdns
 	for _, r := range recs {
 		rr := r.RR()
 		fqdn := libdns.AbsoluteName(rr.Name, zone)
+		value := rr.Data // Get the TXT record content
 		managed := p.deriveManagedZone(fqdn, zone)
 		if managed == "" {
 			continue
 		}
-		prefix := strings.TrimSuffix(strings.TrimSuffix(fqdn, "."+managed), ".")
-		if prefix == managed {
+
+		// Compute relative prefix under managed zone
+		// Remove the managed zone and trailing dot from fqdn
+		fqdnClean := strings.TrimSuffix(fqdn, ".")
+		managedClean := strings.TrimSuffix(managed, ".")
+
+		var prefix string
+		if fqdnClean == managedClean {
 			prefix = "@"
+		} else if strings.HasSuffix(fqdnClean, "."+managedClean) {
+			prefix = strings.TrimSuffix(fqdnClean, "."+managedClean)
+		} else {
+			// Fallback: use the first part before the first dot
+			parts := strings.Split(fqdnClean, ".")
+			prefix = parts[0]
 		}
-		reqBody := map[string]string{
-			"domain": managed,
-			"type":   "TXT",
-			"name":   prefix,
+
+		// Use form-urlencoded format as per API documentation
+		formData := url.Values{}
+		formData.Set("del_record", managed)
+		formData.Set("praefix", prefix)
+		formData.Set("type", "TXT")
+		formData.Set("content", value) // Include content parameter as required by API
+
+		if p.logger != nil {
+			p.logger.Debug("ipv64: DNS delete details",
+				zap.String("fqdn", fqdn),
+				zap.String("zone", zone),
+				zap.String("managed", managed),
+				zap.String("prefix", prefix),
+				zap.String("value", value))
 		}
-		enc, _ := json.Marshal(reqBody)
-		url := "https://ipv64.net/api/dns/delete"
-		if err := p.doWithRetry(ctx, client, http.MethodPost, url, enc); err != nil {
+
+		apiURL := "https://ipv64.net/api"
+		if err := p.doWithRetryForm(ctx, client, http.MethodDelete, apiURL, formData); err != nil {
 			if p.logger != nil {
 				p.logger.Warn("ipv64: delete failed", zap.String("fqdn", fqdn), zap.Error(err))
 			}
@@ -186,38 +249,92 @@ func (p *Provider) DeleteRecords(ctx context.Context, zone string, recs []libdns
 	return deleted, nil
 }
 
-// doWithRetry performs HTTP requests with backoff for 5xx and 429 statuses.
-func (p *Provider) doWithRetry(ctx context.Context, client *http.Client, method, url string, body []byte) error {
+// doWithRetryForm performs form-urlencoded HTTP requests with backoff for 5xx and 429 statuses.
+func (p *Provider) doWithRetryForm(ctx context.Context, client *http.Client, method, apiURL string, formData url.Values) error {
 	backoff := time.Duration(p.InitialBackoffMillis) * time.Millisecond
 	for attempt := 0; attempt < p.MaxRetries; attempt++ {
-		req, err := http.NewRequestWithContext(ctx, method, url, strings.NewReader(string(body)))
+		req, err := http.NewRequestWithContext(ctx, method, apiURL, strings.NewReader(formData.Encode()))
 		if err != nil {
 			return err
 		}
 		req.Header.Set("Authorization", "Bearer "+p.Token)
-		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 		resp, err := client.Do(req)
 		if err != nil {
-			if ne, ok := err.(net.Error); ok && ne.Temporary() {
+			// Retry on network timeouts and connection errors
+			if strings.Contains(err.Error(), "timeout") || strings.Contains(err.Error(), "connection") {
 				time.Sleep(backoff)
 				backoff *= 2
 				continue
 			}
 			return err
 		}
-		// Drain body
+		// Properly read and drain response body before closing
+		respBody, _ := io.ReadAll(resp.Body)
 		_ = resp.Body.Close()
+
 		if resp.StatusCode >= 200 && resp.StatusCode < 300 {
 			return nil
 		}
 		if resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode >= 500 {
+			if p.logger != nil {
+				p.logger.Warn("ipv64 API retrying",
+					zap.Int("status", resp.StatusCode),
+					zap.String("response", string(respBody)),
+					zap.Int("attempt", attempt+1))
+			}
 			time.Sleep(backoff)
 			backoff *= 2
 			continue
 		}
-		return fmt.Errorf("ipv64 API error: %s", resp.Status)
+		return fmt.Errorf("ipv64 API error: %s (response: %s)", resp.Status, string(respBody))
 	}
 	return fmt.Errorf("ipv64 API failed after %d attempts", p.MaxRetries)
+}
+
+// testDomainExists tests if a domain is managed in the ipv64.net API
+func (p *Provider) testDomainExists(ctx context.Context, domain string) bool {
+	client := &http.Client{Timeout: time.Duration(p.TimeoutSeconds) * time.Second}
+
+	// Use list_records to test if the domain exists
+	formData := url.Values{}
+	formData.Set("list_records", domain)
+
+	apiURL := "https://ipv64.net/api"
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, apiURL, strings.NewReader(formData.Encode()))
+	if err != nil {
+		return false
+	}
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.Header.Set("Authorization", "Bearer "+p.Token)
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return false
+	}
+	defer resp.Body.Close()
+
+	respBody, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return false
+	}
+
+	// If status 200 and not "domain not found", then domain exists
+	if resp.StatusCode == 200 {
+		responseStr := string(respBody)
+		// API responds with error if domain doesn't exist
+		return !strings.Contains(responseStr, "domain not found") &&
+			!strings.Contains(responseStr, "error")
+	}
+
+	return false
+}
+
+// parseDomainList extracts domain names from API response
+func (p *Provider) parseDomainList(response string) []string {
+	// TODO: Analyze API response format and parse accordingly
+	// For now return empty list as fallback
+	return []string{}
 }
 
 // deriveManagedZone tries to find the longest matching suffix of fqdn within zone.
@@ -227,18 +344,85 @@ func (p *Provider) deriveManagedZone(fqdn, zone string) string {
 	if fqdn == zone {
 		return zone
 	}
-	// Skip _acme-challenge when deriving
-	parts := strings.Split(fqdn, ".")
-	for i := 0; i < len(parts); i++ {
-		cand := strings.Join(parts[i:], ".")
-		if cand == zone || strings.HasSuffix(zone, "."+cand) || strings.HasSuffix(cand, "."+zone) {
-			if strings.HasPrefix(parts[i], "_acme-challenge") && i+1 < len(parts) {
-				return strings.Join(parts[i+1:], ".")
+
+	// If Domain is explicitly configured, use it
+	if p.Domain != "" {
+		domain := strings.TrimSuffix(p.Domain, ".")
+		return domain
+	}
+
+	// Smart heuristic: Find the managed zone by looking for *64.de/*64.net pattern
+	// This works for all ipv64.net-style domains without API calls
+
+	// Remove _acme-challenge prefix if present
+	workingFqdn := fqdn
+	if strings.HasPrefix(fqdn, "_acme-challenge.") {
+		workingFqdn = strings.TrimPrefix(fqdn, "_acme-challenge.")
+	}
+
+	parts := strings.Split(workingFqdn, ".")
+	if len(parts) >= 3 {
+		// Look for the *64.de or *64.net pattern from right to left
+		for i := len(parts) - 2; i >= 0; i-- {
+			candidate := strings.Join(parts[i:], ".")
+			candidateParts := strings.Split(candidate, ".")
+
+			// Check if this looks like a root managed domain (username.service64.tld)
+			if len(candidateParts) == 3 {
+				service := candidateParts[1] // e.g., "ipv64", "vpn64", "example64"
+				tld := candidateParts[2]     // e.g., "de", "net"
+
+				// If service ends with "64" and TLD is common, this is likely the managed zone
+				if strings.HasSuffix(service, "64") && (tld == "de" || tld == "net") {
+					return candidate
+				}
 			}
-			return cand
 		}
 	}
+
+	// Fallback: use the domain as-is
+	return workingFqdn // Generic fallback
 	return zone
+}
+
+// isIpv64Domain checks if a domain uses any *64.de or *64.net pattern
+func (p *Provider) isIpv64Domain(domain string) bool {
+	domain = strings.TrimSuffix(domain, ".")
+	parts := strings.Split(domain, ".")
+	if len(parts) < 2 {
+		return false
+	}
+
+	// Check for *64.de pattern (e.g., ipv64.de, any64.de, srv64.de)
+	if len(parts) >= 2 {
+		tld := parts[len(parts)-1]     // "de" or "net"
+		service := parts[len(parts)-2] // "ipv64", "any64", etc.
+
+		if (tld == "de" || tld == "net") && strings.HasSuffix(service, "64") {
+			return true
+		}
+	}
+
+	return false
+}
+
+// isRootIpv64Domain checks if a domain is a root *64.de/*64.net domain (e.g., "username.ipv64.de")
+func (p *Provider) isRootIpv64Domain(domain string) bool {
+	domain = strings.TrimSuffix(domain, ".")
+	parts := strings.Split(domain, ".")
+
+	// Root domain should have exactly 3 parts: username.service64.tld
+	if len(parts) != 3 {
+		return false
+	}
+
+	// Check if it matches *64.de or *64.net pattern
+	return p.isIpv64Domain(domain)
+}
+
+// isIpv64Subzone checks if a domain looks like an ipv64.net managed subzone (legacy function)
+func (p *Provider) isIpv64Subzone(domain string) bool {
+	return p.isIpv64Domain(domain)
 }
 
 func normalizeZone(z string) string {
@@ -295,6 +479,15 @@ func (p *Provider) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 					return d.Errf("invalid initial_backoff_ms: %s", d.Val())
 				}
 				p.InitialBackoffMillis = v
+			case "create_delay_seconds":
+				if !d.NextArg() {
+					return d.ArgErr()
+				}
+				var v int
+				if _, err := fmt.Sscanf(d.Val(), "%d", &v); err != nil || v < 0 {
+					return d.Errf("invalid create_delay_seconds: %s", d.Val())
+				}
+				p.CreateDelaySeconds = v
 			case "delete_delay_seconds":
 				if !d.NextArg() {
 					return d.ArgErr()
