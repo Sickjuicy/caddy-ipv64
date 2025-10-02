@@ -51,20 +51,16 @@ func (p *Provider) Provision(ctx caddy.Context) error {
 		p.Token = os.Getenv("IPV64_API_TOKEN")
 	}
 	if p.TimeoutSeconds <= 0 {
-		p.TimeoutSeconds = 5
+		p.TimeoutSeconds = 10
 	}
 	if p.MaxRetries <= 0 {
-		p.MaxRetries = 3
+		p.MaxRetries = 5
 	}
 	if p.InitialBackoffMillis <= 0 {
-		p.InitialBackoffMillis = 400
+		p.InitialBackoffMillis = 500
 	}
-	if p.CreateDelaySeconds <= 0 {
-		p.CreateDelaySeconds = 25
-	}
-	if p.DeleteDelaySeconds < 0 {
-		p.DeleteDelaySeconds = 0
-	}
+	// Note: CreateDelaySeconds and DeleteDelaySeconds are no longer used
+	// CertMagic's DNS-01 solver handles propagation delays internally
 	if len(p.Resolvers) == 0 {
 		// Prefer ipv64 nameservers first, then common public resolvers
 		p.Resolvers = []string{
@@ -82,6 +78,16 @@ func (p *Provider) Provision(ctx caddy.Context) error {
 			}
 		}
 	}
+	
+	// Log configuration for debugging
+	if p.logger != nil {
+		p.logger.Info("ipv64 DNS provider provisioned",
+			zap.Int("max_retries", p.MaxRetries),
+			zap.Int("timeout_seconds", p.TimeoutSeconds),
+			zap.Int("initial_backoff_millis", p.InitialBackoffMillis),
+			zap.Strings("resolvers", p.Resolvers))
+	}
+	
 	return nil
 }
 
@@ -133,7 +139,7 @@ func (p *Provider) AppendRecords(ctx context.Context, zone string, recs []libdns
 		}
 
 		if p.logger != nil {
-			p.logger.Debug("ipv64: DNS record details",
+			p.logger.Info("ipv64: creating DNS challenge record",
 				zap.String("fqdn", fqdn),
 				zap.String("zone", zone),
 				zap.String("managed", managed),
@@ -155,23 +161,12 @@ func (p *Provider) AppendRecords(ctx context.Context, zone string, recs []libdns
 		}
 		appended = append(appended, r)
 		if p.logger != nil {
-			p.logger.Debug("ipv64: appended TXT", zap.String("fqdn", fqdn), zap.String("zone", managed))
+			p.logger.Info("ipv64: DNS record created successfully", zap.String("fqdn", fqdn), zap.String("zone", managed))
 		}
 	}
 
-	// Wait for DNS propagation after creating records
-	if p.CreateDelaySeconds > 0 {
-		if p.logger != nil {
-			p.logger.Debug("ipv64: waiting for DNS propagation after record creation",
-				zap.Int("delay_seconds", p.CreateDelaySeconds))
-		}
-		select {
-		case <-time.After(time.Duration(p.CreateDelaySeconds) * time.Second):
-		case <-ctx.Done():
-			return appended, ctx.Err()
-		}
-	}
-
+	// Note: DNS propagation delay is handled by CertMagic's DNS-01 solver
+	// No need to wait here - let CertMagic manage propagation timing
 	return appended, nil
 }
 
@@ -183,15 +178,9 @@ func (p *Provider) DeleteRecords(ctx context.Context, zone string, recs []libdns
 	zone = normalizeZone(zone)
 	client := &http.Client{Timeout: time.Duration(p.TimeoutSeconds) * time.Second}
 
-	// Delay delete to reduce flakiness during secondary validation
-	if p.DeleteDelaySeconds > 0 {
-		select {
-		case <-time.After(time.Duration(p.DeleteDelaySeconds) * time.Second):
-		case <-ctx.Done():
-			return nil, ctx.Err()
-		}
-	}
-
+	// Note: DNS cleanup delay is handled by CertMagic's DNS-01 solver
+	// No need to wait here - CertMagic already waits between challenge verification and cleanup
+	
 	var deleted []libdns.Record
 	for _, r := range recs {
 		rr := r.RR()
@@ -243,7 +232,7 @@ func (p *Provider) DeleteRecords(ctx context.Context, zone string, recs []libdns
 		}
 		deleted = append(deleted, r)
 		if p.logger != nil {
-			p.logger.Debug("ipv64: deleted TXT", zap.String("fqdn", fqdn), zap.String("zone", managed))
+			p.logger.Info("ipv64: DNS record deleted successfully", zap.String("fqdn", fqdn), zap.String("zone", managed))
 		}
 	}
 	return deleted, nil
