@@ -51,7 +51,9 @@ func (p *Provider) Provision(ctx caddy.Context) error {
 		p.Token = os.Getenv("IPV64_API_TOKEN")
 	}
 	if p.TimeoutSeconds <= 0 {
-		p.TimeoutSeconds = 10
+		// Default: 30 seconds (same as Lego's ipv64 provider)
+		// This is higher than our previous 10s to handle slower API responses
+		p.TimeoutSeconds = 30
 	}
 	if p.MaxRetries <= 0 {
 		p.MaxRetries = 5
