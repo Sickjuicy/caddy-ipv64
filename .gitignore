@@ -61,3 +61,4 @@ temp/
 # Optional: local Caddy runtime data if created inside repo (usually outside)
 autosave.json
 .caddy/
+.github

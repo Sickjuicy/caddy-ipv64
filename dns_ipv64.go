@@ -61,24 +61,41 @@ func (p *Provider) Provision(ctx caddy.Context) error {
 	}
 	// Note: CreateDelaySeconds and DeleteDelaySeconds are no longer used
 	// CertMagic's DNS-01 solver handles propagation delays internally
+
+	// IMPORTANT: Always use ipv64.net nameservers for DNS propagation checks
+	// to avoid local DNS resolution issues that can cause certificate failures.
+	// If user explicitly sets resolvers, ensure ipv64 nameservers are included.
 	if len(p.Resolvers) == 0 {
-		// Prefer ipv64 nameservers first, then common public resolvers
+		// Default: Use ipv64.net authoritative nameservers first, then public DNS for redundancy
 		p.Resolvers = []string{
-			"ns1.ipv64.net:53",
-			"ns2.ipv64.net:53",
-			"1.1.1.1:53",
-			"8.8.8.8:53",
-			"9.9.9.9:53",
+			"ns1.ipv64.net:53", // Primary ipv64 nameserver
+			"ns2.ipv64.net:53", // Secondary ipv64 nameserver
+			"1.1.1.1:53",       // Cloudflare public DNS
+			"8.8.8.8:53",       // Google public DNS
 		}
+		p.logger.Info("ipv64: using default resolvers (ipv64 nameservers + public DNS)")
 	} else {
-		// normalize to include :53 if missing
+		// User provided custom resolvers - normalize and warn if ipv64 nameservers missing
 		for i, r := range p.Resolvers {
 			if !strings.Contains(r, ":") {
 				p.Resolvers[i] = r + ":53"
 			}
 		}
+
+		// Check if ipv64 nameservers are included
+		hasIpv64NS := false
+		for _, r := range p.Resolvers {
+			if strings.Contains(r, "ns1.ipv64.net") || strings.Contains(r, "ns2.ipv64.net") {
+				hasIpv64NS = true
+				break
+			}
+		}
+		if !hasIpv64NS && p.logger != nil {
+			p.logger.Warn("ipv64: custom resolvers configured without ipv64.net nameservers - this may cause DNS propagation issues",
+				zap.Strings("resolvers", p.Resolvers))
+		}
 	}
-	
+
 	// Log configuration for debugging
 	if p.logger != nil {
 		p.logger.Info("ipv64 DNS provider provisioned",
@@ -87,7 +104,7 @@ func (p *Provider) Provision(ctx caddy.Context) error {
 			zap.Int("initial_backoff_millis", p.InitialBackoffMillis),
 			zap.Strings("resolvers", p.Resolvers))
 	}
-	
+
 	return nil
 }
 
@@ -180,7 +197,7 @@ func (p *Provider) DeleteRecords(ctx context.Context, zone string, recs []libdns
 
 	// Note: DNS cleanup delay is handled by CertMagic's DNS-01 solver
 	// No need to wait here - CertMagic already waits between challenge verification and cleanup
-	
+
 	var deleted []libdns.Record
 	for _, r := range recs {
 		rr := r.RR()
