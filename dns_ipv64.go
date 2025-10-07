@@ -40,9 +40,31 @@ var (
 		"8.8.8.8:53",
 	}
 
-	// Supported ipv64.net TLDs
-	// Pattern matching checks for *64.de and *64.net domains
-	// This covers all standard ipv64.net services (ipv64, vpn64, srv64, dns64, etc.)
+	// Known ipv64.net service names (second-to-last part of domain)
+	// Current as of October 2025 - see https://ipv64.net for latest list
+	// Format: username.<service>.de or username.<service>.net
+	knownServices = []string{
+		"ipv64",    // ipv64.de, ipv64.net - Main service
+		"any64",    // any64.de - Generic service
+		"api64",    // api64.de - API service
+		"dns64",    // dns64.de - DNS service
+		"dyndns64", // dyndns64.de - DynDNS service
+		"dynipv6",  // dynipv6.de - IPv6 DynDNS (exception: doesn't end in "64")
+		"eth64",    // eth64.de - Ethernet service
+		"home64",   // home64.de - Home service
+		"iot64",    // iot64.de - IoT service
+		"lan64",    // lan64.de - LAN service
+		"nas64",    // nas64.de - NAS service
+		"root64",   // root64.de - Root service
+		"route64",  // route64.de - Routing service
+		"srv64",    // srv64.de - Server service
+		"tcp64",    // tcp64.de - TCP service
+		"udp64",    // udp64.de - UDP service
+		"vpn64",    // vpn64.de, vpn64.net - VPN service
+		"wan64",    // wan64.de - WAN service
+	}
+
+	// Supported TLDs for ipv64.net services
 	supportedTLDs = []string{"de", "net"}
 )
 
@@ -149,27 +171,34 @@ func (p *Provider) Validate() error {
 }
 
 // isIpv64Domain checks if a zone matches the ipv64.net domain pattern.
-// Valid patterns: username.ipv64.de, username.vpn64.net, etc.
-// Requires at least 3 parts, second-to-last ends with "64", TLD is in supportedTLDs.
+// Valid patterns: username.ipv64.de, username.vpn64.net, username.dynipv6.de, etc.
+// Requires at least 3 parts, second-to-last is a known service name, TLD is in supportedTLDs.
 //
-// Note: Uses pattern matching instead of API queries to avoid:
-//   - Extra API calls consuming rate limits
-//   - Network latency on every domain check
-//   - Failures when API is unavailable
+// Uses an explicit list of known services instead of pattern matching for:
+//   - Explicit validation (no false positives)
+//   - Easy maintenance (add new services to knownServices list)
+//   - Clear documentation (list shows all supported services)
 //
-// The pattern (*64.de, *64.net) has been stable since ipv64.net's inception.
-// If new TLDs are added, update the supportedTLDs variable.
+// To add support for new ipv64.net services, update the knownServices variable.
 func isIpv64Domain(zone string) bool {
 	parts := strings.Split(strings.TrimSuffix(zone, "."), ".")
 	if len(parts) < 3 {
 		return false
 	}
 
-	// Check if second-to-last part ends with "64" (ipv64, vpn64, etc.)
+	// Check if second-to-last part is a known ipv64.net service
 	service := parts[len(parts)-2]
 	tld := parts[len(parts)-1]
 
-	if !strings.HasSuffix(service, "64") {
+	// Check if service is in the known services list
+	serviceFound := false
+	for _, knownService := range knownServices {
+		if service == knownService {
+			serviceFound = true
+			break
+		}
+	}
+	if !serviceFound {
 		return false
 	}
 
@@ -374,11 +403,11 @@ func (p *Provider) doWithRetryForm(ctx context.Context, client *http.Client, met
 }
 
 // deriveManagedZone finds the managed ipv64.net zone for a given FQDN.
-// It searches for the *64.de or *64.net pattern (e.g., sickjuicy.ipv64.de).
+// It searches for the *64.de or *64.net pattern (e.g., yourdomain.ipv64.de).
 // Examples:
-//   - _acme-challenge.app.sickjuicy.ipv64.de -> sickjuicy.ipv64.de
-//   - subdomain.sickjuicy.ipv64.de -> sickjuicy.ipv64.de
-//   - sickjuicy.ipv64.de -> sickjuicy.ipv64.de
+//   - _acme-challenge.app.yourdomain.ipv64.de -> yourdomain.ipv64.de
+//   - subdomain.yourdomain.ipv64.de -> yourdomain.ipv64.de
+//   - yourdomain.ipv64.de -> yourdomain.ipv64.de
 func (p *Provider) deriveManagedZone(fqdn, zone string) string {
 	fqdn = strings.TrimSuffix(fqdn, ".")
 	zone = strings.TrimSuffix(zone, ".")
@@ -392,7 +421,9 @@ func (p *Provider) deriveManagedZone(fqdn, zone string) string {
 
 	// Search from right to left for *64.de or *64.net pattern
 	parts := strings.Split(workingFqdn, ".")
-	for i := len(parts) - 2; i >= 0; i-- {
+	// Need at least 3 parts for username.service64.tld (e.g., yourdomain.ipv64.de)
+	// Start from len(parts)-3 to ensure we have enough parts
+	for i := len(parts) - 3; i >= 0; i-- {
 		candidate := strings.Join(parts[i:], ".")
 		if isIpv64Domain(candidate + ".") {
 			return candidate
@@ -405,8 +436,8 @@ func (p *Provider) deriveManagedZone(fqdn, zone string) string {
 
 // computePrefix calculates the relative DNS prefix under the managed zone.
 // Examples:
-//   - FQDN: _acme-challenge.app.sickjuicy.ipv64.de, Managed: sickjuicy.ipv64.de -> "_acme-challenge.app"
-//   - FQDN: sickjuicy.ipv64.de, Managed: sickjuicy.ipv64.de -> "@"
+//   - FQDN: _acme-challenge.app.yourdomain.ipv64.de, Managed: yourdomain.ipv64.de -> "_acme-challenge.app"
+//   - FQDN: yourdomain.ipv64.de, Managed: yourdomain.ipv64.de -> "@"
 func (p *Provider) computePrefix(fqdn, managed string) string {
 	fqdnClean := strings.TrimSuffix(fqdn, ".")
 	managedClean := strings.TrimSuffix(managed, ".")
