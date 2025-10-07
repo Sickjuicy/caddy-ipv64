@@ -19,18 +19,17 @@ import (
 
 // Provider implements libdns for ipv64.net and a Caddy DNS provider module.
 type Provider struct {
-	Token                string   `json:"api_token,omitempty" caddy:"namespace=dns.providers.ipv64"`
-	Domain               string   `json:"domain,omitempty"`
-	Resolvers            []string `json:"resolvers,omitempty"`
-	TimeoutSeconds       int      `json:"timeout_seconds,omitempty"`
-	MaxRetries           int      `json:"max_retries,omitempty"`
-	InitialBackoffMillis int      `json:"initial_backoff_ms,omitempty"`
-	CreateDelaySeconds   int      `json:"create_delay_seconds,omitempty"`
-	DeleteDelaySeconds   int      `json:"delete_delay_seconds,omitempty"`
+	// API Configuration
+	Token                string `json:"api_token,omitempty" caddy:"namespace=dns.providers.ipv64"`
+	TimeoutSeconds       int    `json:"timeout_seconds,omitempty"`
+	MaxRetries           int    `json:"max_retries,omitempty"`
+	InitialBackoffMillis int    `json:"initial_backoff_ms,omitempty"`
 
-	logger        *zap.Logger
-	cachedDomains []string // Cache for available domains
-	domainsCached bool     // Flag whether domains have been retrieved
+	// DNS Resolver Configuration
+	Resolvers []string `json:"resolvers,omitempty"`
+
+	// Internal state
+	logger *zap.Logger
 }
 
 // Note: We implement AppendRecords/DeleteRecords required by Caddy's libdns bridge.
@@ -61,8 +60,6 @@ func (p *Provider) Provision(ctx caddy.Context) error {
 	if p.InitialBackoffMillis <= 0 {
 		p.InitialBackoffMillis = 500
 	}
-	// Note: CreateDelaySeconds and DeleteDelaySeconds are no longer used
-	// CertMagic's DNS-01 solver handles propagation delays internally
 
 	// IMPORTANT: Always use ipv64.net nameservers for DNS propagation checks
 	// to avoid local DNS resolution issues that can cause certificate failures.
@@ -105,6 +102,13 @@ func (p *Provider) Provision(ctx caddy.Context) error {
 			zap.Int("timeout_seconds", p.TimeoutSeconds),
 			zap.Int("initial_backoff_millis", p.InitialBackoffMillis),
 			zap.Strings("resolvers", p.Resolvers))
+
+		// Warn users about recommended TLS settings for reliable certificate issuance
+		p.logger.Warn("ipv64: IMPORTANT - For reliable wildcard certificates, configure in your Caddyfile:",
+			zap.String("resolvers", "ns1.ipv64.net ns2.ipv64.net 1.1.1.1 8.8.8.8"),
+			zap.String("propagation_timeout", "90s (ipv64.net DNS takes 30-90s to propagate)"),
+			zap.String("propagation_delay", "15s (slower checks = more time before deletion, prevents 'No TXT record found' errors)"),
+			zap.String("example", "See README.md for full configuration examples"))
 	}
 
 	return nil
@@ -353,12 +357,6 @@ func (p *Provider) deriveManagedZone(fqdn, zone string) string {
 		return zone
 	}
 
-	// If Domain is explicitly configured, use it
-	if p.Domain != "" {
-		domain := strings.TrimSuffix(p.Domain, ".")
-		return domain
-	}
-
 	// Smart heuristic: Find the managed zone by looking for *64.de/*64.net pattern
 	// This works for all ipv64.net-style domains without API calls
 
@@ -389,29 +387,7 @@ func (p *Provider) deriveManagedZone(fqdn, zone string) string {
 	}
 
 	// Fallback: use the domain as-is
-	return workingFqdn // Generic fallback
-	return zone
-}
-
-// isIpv64Domain checks if a domain uses any *64.de or *64.net pattern
-func (p *Provider) isIpv64Domain(domain string) bool {
-	domain = strings.TrimSuffix(domain, ".")
-	parts := strings.Split(domain, ".")
-	if len(parts) < 2 {
-		return false
-	}
-
-	// Check for *64.de pattern (e.g., ipv64.de, any64.de, srv64.de)
-	if len(parts) >= 2 {
-		tld := parts[len(parts)-1]     // "de" or "net"
-		service := parts[len(parts)-2] // "ipv64", "any64", etc.
-
-		if (tld == "de" || tld == "net") && strings.HasSuffix(service, "64") {
-			return true
-		}
-	}
-
-	return false
+	return workingFqdn
 }
 
 // isRootIpv64Domain checks if a domain is a root *64.de/*64.net domain (e.g., "username.ipv64.de")
@@ -425,12 +401,25 @@ func (p *Provider) isRootIpv64Domain(domain string) bool {
 	}
 
 	// Check if it matches *64.de or *64.net pattern
-	return p.isIpv64Domain(domain)
+	tld := parts[len(parts)-1]     // "de" or "net"
+	service := parts[len(parts)-2] // "ipv64", "any64", etc.
+
+	return (tld == "de" || tld == "net") && strings.HasSuffix(service, "64")
 }
 
-// isIpv64Subzone checks if a domain looks like an ipv64.net managed subzone (legacy function)
+// isIpv64Subzone checks if a domain uses any *64.de or *64.net pattern
 func (p *Provider) isIpv64Subzone(domain string) bool {
-	return p.isIpv64Domain(domain)
+	domain = strings.TrimSuffix(domain, ".")
+	parts := strings.Split(domain, ".")
+	if len(parts) < 2 {
+		return false
+	}
+
+	// Check for *64.de pattern (e.g., ipv64.de, any64.de, srv64.de)
+	tld := parts[len(parts)-1]     // "de" or "net"
+	service := parts[len(parts)-2] // "ipv64", "any64", etc.
+
+	return (tld == "de" || tld == "net") && strings.HasSuffix(service, "64")
 }
 
 func normalizeZone(z string) string {
@@ -450,11 +439,6 @@ func (p *Provider) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 					return d.ArgErr()
 				}
 				p.Token = d.Val()
-			case "domain":
-				if !d.NextArg() {
-					return d.ArgErr()
-				}
-				p.Domain = d.Val()
 			case "resolver":
 				// one or many
 				for d.NextArg() {
@@ -487,24 +471,6 @@ func (p *Provider) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 					return d.Errf("invalid initial_backoff_ms: %s", d.Val())
 				}
 				p.InitialBackoffMillis = v
-			case "create_delay_seconds":
-				if !d.NextArg() {
-					return d.ArgErr()
-				}
-				var v int
-				if _, err := fmt.Sscanf(d.Val(), "%d", &v); err != nil || v < 0 {
-					return d.Errf("invalid create_delay_seconds: %s", d.Val())
-				}
-				p.CreateDelaySeconds = v
-			case "delete_delay_seconds":
-				if !d.NextArg() {
-					return d.ArgErr()
-				}
-				var v int
-				if _, err := fmt.Sscanf(d.Val(), "%d", &v); err != nil || v < 0 {
-					return d.Errf("invalid delete_delay_seconds: %s", d.Val())
-				}
-				p.DeleteDelaySeconds = v
 			}
 		}
 	}
