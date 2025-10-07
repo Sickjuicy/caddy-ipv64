@@ -287,12 +287,6 @@ func (p *Provider) DeleteRecords(ctx context.Context, zone string, recs []libdns
 		return nil, err
 	}
 
-	// Check if this is an ipv64.net domain
-	if !isIpv64Domain(zone) {
-		p.logger.Debug("ipv64: skipping non-ipv64 domain", zap.String("zone", zone))
-		return recs, nil
-	}
-
 	zone = normalizeZone(zone)
 
 	var deleted []libdns.Record
@@ -300,8 +294,22 @@ func (p *Provider) DeleteRecords(ctx context.Context, zone string, recs []libdns
 		rr := r.RR()
 		fqdn := libdns.AbsoluteName(rr.Name, zone)
 		value := rr.Data
+
+		// Derive the actual managed zone from the FQDN
 		managed := p.deriveManagedZone(fqdn, zone)
 		if managed == "" {
+			p.logger.Debug("ipv64: cannot derive managed zone for deletion",
+				zap.String("fqdn", fqdn),
+				zap.String("zone", zone))
+			continue
+		}
+
+		// Validate that this is an ipv64.net domain using the derived managed zone
+		if !isIpv64Domain(managed + ".") {
+			p.logger.Debug("ipv64: skipping non-ipv64 domain for deletion",
+				zap.String("zone", zone),
+				zap.String("fqdn", fqdn),
+				zap.String("managed", managed))
 			continue
 		}
 
