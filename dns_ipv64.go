@@ -39,9 +39,15 @@ var (
 		"1.1.1.1:53",
 		"8.8.8.8:53",
 	}
+
+	// Supported ipv64.net TLDs
+	// Pattern matching checks for *64.de and *64.net domains
+	// This covers all standard ipv64.net services (ipv64, vpn64, srv64, dns64, etc.)
+	supportedTLDs = []string{"de", "net"}
 )
 
-// Provider implements libdns for ipv64.net and a Caddy DNS provider module.
+// Provider implements the libdns.Provider interface for ipv64.net DNS-01 ACME challenges.
+// It also serves as a Caddy module (dns.providers.ipv64).
 type Provider struct {
 	// API Configuration
 	Token                string `json:"api_token,omitempty" caddy:"namespace=dns.providers.ipv64"`
@@ -57,10 +63,7 @@ type Provider struct {
 	logger     *zap.Logger
 }
 
-// Note: We implement AppendRecords/DeleteRecords required by Caddy's libdns bridge.
-// GetRecords/SetRecords are optional and implemented as stubs below.
-
-// Caddy module registration
+// CaddyModule returns the Caddy module information.
 func (Provider) CaddyModule() caddy.ModuleInfo {
 	return caddy.ModuleInfo{
 		ID:  "dns.providers.ipv64",
@@ -68,7 +71,7 @@ func (Provider) CaddyModule() caddy.ModuleInfo {
 	}
 }
 
-// Provision sets defaults and environment fallbacks.
+// Provision sets up the provider with defaults and validates configuration.
 func (p *Provider) Provision(ctx caddy.Context) error {
 	p.logger = ctx.Logger(p)
 
@@ -137,7 +140,7 @@ func (p *Provider) Provision(ctx caddy.Context) error {
 	return nil
 }
 
-// Validate ensures required fields are present.
+// Validate ensures the API token is configured.
 func (p *Provider) Validate() error {
 	if p.Token == "" {
 		return errors.New("api_token is required (or set IPV64_API_TOKEN)")
@@ -145,7 +148,17 @@ func (p *Provider) Validate() error {
 	return nil
 }
 
-// isIpv64Domain checks if a zone is an ipv64.net managed domain
+// isIpv64Domain checks if a zone matches the ipv64.net domain pattern.
+// Valid patterns: username.ipv64.de, username.vpn64.net, etc.
+// Requires at least 3 parts, second-to-last ends with "64", TLD is in supportedTLDs.
+//
+// Note: Uses pattern matching instead of API queries to avoid:
+//   - Extra API calls consuming rate limits
+//   - Network latency on every domain check
+//   - Failures when API is unavailable
+//
+// The pattern (*64.de, *64.net) has been stable since ipv64.net's inception.
+// If new TLDs are added, update the supportedTLDs variable.
 func isIpv64Domain(zone string) bool {
 	parts := strings.Split(strings.TrimSuffix(zone, "."), ".")
 	if len(parts) < 3 {
@@ -153,9 +166,21 @@ func isIpv64Domain(zone string) bool {
 	}
 
 	// Check if second-to-last part ends with "64" (ipv64, vpn64, etc.)
-	// and TLD is .de or .net
-	return strings.HasSuffix(parts[len(parts)-2], "64") &&
-		(parts[len(parts)-1] == "de" || parts[len(parts)-1] == "net")
+	service := parts[len(parts)-2]
+	tld := parts[len(parts)-1]
+
+	if !strings.HasSuffix(service, "64") {
+		return false
+	}
+
+	// Check if TLD is supported
+	for _, supportedTLD := range supportedTLDs {
+		if tld == supportedTLD {
+			return true
+		}
+	}
+
+	return false
 }
 
 // SetResolvers can be used by tests to override resolvers.
@@ -163,7 +188,8 @@ func (p *Provider) SetResolvers(resolvers []string) {
 	p.Resolvers = resolvers
 }
 
-// AppendRecords creates TXT records for the ACME dns-01 challenge.
+// AppendRecords creates TXT records for ACME DNS-01 challenges.
+// This is the primary method used by Caddy's ACME automation.
 func (p *Provider) AppendRecords(ctx context.Context, zone string, recs []libdns.Record) ([]libdns.Record, error) {
 	if err := p.Validate(); err != nil {
 		return nil, err
@@ -199,7 +225,7 @@ func (p *Provider) AppendRecords(ctx context.Context, zone string, recs []libdns
 			zap.String("prefix", prefix),
 			zap.String("value", value))
 
-		// Use form-urlencoded format as per API documentation
+		// Use ipv64.net API format (note: "praefix" is the German spelling used by the API)
 		formData := url.Values{}
 		formData.Set("add_record", managed)
 		formData.Set("praefix", prefix)
@@ -217,7 +243,7 @@ func (p *Provider) AppendRecords(ctx context.Context, zone string, recs []libdns
 	return appended, nil
 }
 
-// DeleteRecords deletes TXT records.
+// DeleteRecords removes TXT records after ACME validation completes.
 func (p *Provider) DeleteRecords(ctx context.Context, zone string, recs []libdns.Record) ([]libdns.Record, error) {
 	if err := p.Validate(); err != nil {
 		return nil, err
@@ -270,7 +296,8 @@ func (p *Provider) DeleteRecords(ctx context.Context, zone string, recs []libdns
 	return deleted, nil
 }
 
-// doWithRetryForm performs form-urlencoded HTTP requests with exponential backoff.
+// doWithRetryForm performs HTTP requests with exponential backoff retry logic.
+// Retries on network errors, 5xx server errors, and 429 rate limiting.
 func (p *Provider) doWithRetryForm(ctx context.Context, client *http.Client, method, apiURL string, formData url.Values) error {
 	var lastErr error
 	backoff := time.Duration(p.InitialBackoffMillis) * time.Millisecond
@@ -307,9 +334,17 @@ func (p *Provider) doWithRetryForm(ctx context.Context, client *http.Client, met
 			)
 			continue
 		}
+		defer resp.Body.Close()
 
-		body, _ := io.ReadAll(resp.Body)
-		resp.Body.Close()
+		body, err := io.ReadAll(resp.Body)
+		if err != nil {
+			lastErr = fmt.Errorf("reading response body: %w", err)
+			p.logger.Warn("ipv64: failed to read response body",
+				zap.Error(err),
+				zap.Int("attempt", attempt+1),
+			)
+			continue
+		}
 
 		// Success
 		if resp.StatusCode >= 200 && resp.StatusCode < 300 {
@@ -338,137 +373,60 @@ func (p *Provider) doWithRetryForm(ctx context.Context, client *http.Client, met
 	return fmt.Errorf("max retries (%d) exceeded: %w", p.MaxRetries, lastErr)
 }
 
-// testDomainExists tests if a domain is managed in the ipv64.net API
-func (p *Provider) testDomainExists(ctx context.Context, domain string) bool {
-	formData := url.Values{}
-	formData.Set("list_records", domain)
-
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, apiEndpoint, strings.NewReader(formData.Encode()))
-	if err != nil {
-		return false
-	}
-	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	req.Header.Set("Authorization", "Bearer "+p.Token)
-
-	resp, err := p.httpClient.Do(req)
-	if err != nil {
-		return false
-	}
-	defer resp.Body.Close()
-
-	respBody, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return false
-	}
-
-	// If status 200 and not "domain not found", then domain exists
-	if resp.StatusCode == 200 {
-		responseStr := string(respBody)
-		// API responds with error if domain doesn't exist
-		return !strings.Contains(responseStr, "domain not found") &&
-			!strings.Contains(responseStr, "error")
-	}
-	return false
-}
-
-// parseDomainList extracts domain names from API response
-func (p *Provider) parseDomainList(response string) []string {
-	// TODO: Analyze API response format and parse accordingly
-	// For now return empty list as fallback
-	return []string{}
-}
-
-// deriveManagedZone tries to find the longest matching suffix of fqdn within zone.
+// deriveManagedZone finds the managed ipv64.net zone for a given FQDN.
+// It searches for the *64.de or *64.net pattern (e.g., sickjuicy.ipv64.de).
+// Examples:
+//   - _acme-challenge.app.sickjuicy.ipv64.de -> sickjuicy.ipv64.de
+//   - subdomain.sickjuicy.ipv64.de -> sickjuicy.ipv64.de
+//   - sickjuicy.ipv64.de -> sickjuicy.ipv64.de
 func (p *Provider) deriveManagedZone(fqdn, zone string) string {
 	fqdn = strings.TrimSuffix(fqdn, ".")
 	zone = strings.TrimSuffix(zone, ".")
+
 	if fqdn == zone {
 		return zone
 	}
 
-	// Smart heuristic: Find the managed zone by looking for *64.de/*64.net pattern
-	// This works for all ipv64.net-style domains without API calls
+	// Remove _acme-challenge prefix for cleaner pattern matching
+	workingFqdn := strings.TrimPrefix(fqdn, "_acme-challenge.")
 
-	// Remove _acme-challenge prefix if present
-	workingFqdn := fqdn
-	if strings.HasPrefix(fqdn, "_acme-challenge.") {
-		workingFqdn = strings.TrimPrefix(fqdn, "_acme-challenge.")
-	}
-
+	// Search from right to left for *64.de or *64.net pattern
 	parts := strings.Split(workingFqdn, ".")
-	if len(parts) >= 3 {
-		// Look for the *64.de or *64.net pattern from right to left
-		for i := len(parts) - 2; i >= 0; i-- {
-			candidate := strings.Join(parts[i:], ".")
-			candidateParts := strings.Split(candidate, ".")
-
-			// Check if this looks like a root managed domain (username.service64.tld)
-			if len(candidateParts) == 3 {
-				service := candidateParts[1] // e.g., "ipv64", "vpn64", "example64"
-				tld := candidateParts[2]     // e.g., "de", "net"
-
-				// If service ends with "64" and TLD is common, this is likely the managed zone
-				if strings.HasSuffix(service, "64") && (tld == "de" || tld == "net") {
-					return candidate
-				}
-			}
+	for i := len(parts) - 2; i >= 0; i-- {
+		candidate := strings.Join(parts[i:], ".")
+		if isIpv64Domain(candidate + ".") {
+			return candidate
 		}
 	}
 
-	// Fallback: use the domain as-is
+	// Fallback: use the working FQDN as-is
 	return workingFqdn
 }
 
-// isRootIpv64Domain checks if a domain is a root *64.de/*64.net domain (e.g., "username.ipv64.de")
-func (p *Provider) isRootIpv64Domain(domain string) bool {
-	domain = strings.TrimSuffix(domain, ".")
-	parts := strings.Split(domain, ".")
-
-	// Root domain should have exactly 3 parts: username.service64.tld
-	if len(parts) != 3 {
-		return false
-	}
-
-	// Check if it matches *64.de or *64.net pattern
-	tld := parts[len(parts)-1]     // "de" or "net"
-	service := parts[len(parts)-2] // "ipv64", "any64", etc.
-
-	return (tld == "de" || tld == "net") && strings.HasSuffix(service, "64")
-}
-
-// computePrefix calculates the relative prefix under the managed zone
+// computePrefix calculates the relative DNS prefix under the managed zone.
+// Examples:
+//   - FQDN: _acme-challenge.app.sickjuicy.ipv64.de, Managed: sickjuicy.ipv64.de -> "_acme-challenge.app"
+//   - FQDN: sickjuicy.ipv64.de, Managed: sickjuicy.ipv64.de -> "@"
 func (p *Provider) computePrefix(fqdn, managed string) string {
 	fqdnClean := strings.TrimSuffix(fqdn, ".")
 	managedClean := strings.TrimSuffix(managed, ".")
 
+	// Root domain case
 	if fqdnClean == managedClean {
 		return "@"
 	}
 
+	// Subdomain case: strip managed zone suffix
 	if strings.HasSuffix(fqdnClean, "."+managedClean) {
 		return strings.TrimSuffix(fqdnClean, "."+managedClean)
 	}
 
-	// Fallback: use the first part before the first dot
+	// Fallback: return first label
 	parts := strings.Split(fqdnClean, ".")
 	return parts[0]
 }
 
-// isIpv64Subzone checks if a domain uses any *64.de or *64.net pattern
-func (p *Provider) isIpv64Subzone(domain string) bool {
-	domain = strings.TrimSuffix(domain, ".")
-	parts := strings.Split(domain, ".")
-	if len(parts) < 2 {
-		return false
-	}
-
-	// Check for *64.de pattern (e.g., ipv64.de, any64.de, srv64.de)
-	tld := parts[len(parts)-1]     // "de" or "net"
-	service := parts[len(parts)-2] // "ipv64", "any64", etc.
-
-	return (tld == "de" || tld == "net") && strings.HasSuffix(service, "64")
-}
-
+// normalizeZone ensures zone names end with a dot for libdns compatibility.
 func normalizeZone(z string) string {
 	if !strings.HasSuffix(z, ".") {
 		z += "."
