@@ -238,6 +238,12 @@ func (p *Provider) AppendRecords(ctx context.Context, zone string, recs []libdns
 		fqdn := libdns.AbsoluteName(rr.Name, zone)
 		value := rr.Data
 
+		// DEBUG: Log input parameters
+		p.logger.Debug("ipv64: AppendRecords called",
+			zap.String("record_name", rr.Name),
+			zap.String("zone_param", zone),
+			zap.String("fqdn", fqdn))
+
 		// ipv64.net expects relative label under the managed domain
 		managed := p.deriveManagedZone(fqdn, zone)
 		if managed == "" {
@@ -408,13 +414,11 @@ func (p *Provider) doWithRetryForm(ctx context.Context, client *http.Client, met
 //   - _acme-challenge.app.yourdomain.ipv64.de -> yourdomain.ipv64.de
 //   - subdomain.yourdomain.ipv64.de -> yourdomain.ipv64.de
 //   - yourdomain.ipv64.de -> yourdomain.ipv64.de
+//
+// NOTE: The 'zone' parameter is IGNORED because CertMagic sometimes passes incorrect zones
+// (e.g., "ipv64.de" instead of "sickcloud.ipv64.de"). We derive the zone from the FQDN only.
 func (p *Provider) deriveManagedZone(fqdn, zone string) string {
 	fqdn = strings.TrimSuffix(fqdn, ".")
-	zone = strings.TrimSuffix(zone, ".")
-
-	if fqdn == zone {
-		return zone
-	}
 
 	// Remove _acme-challenge prefix for cleaner pattern matching
 	workingFqdn := strings.TrimPrefix(fqdn, "_acme-challenge.")
