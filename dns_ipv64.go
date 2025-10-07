@@ -224,12 +224,6 @@ func (p *Provider) AppendRecords(ctx context.Context, zone string, recs []libdns
 		return nil, err
 	}
 
-	// Check if this is an ipv64.net domain
-	if !isIpv64Domain(zone) {
-		p.logger.Debug("ipv64: skipping non-ipv64 domain", zap.String("zone", zone))
-		return recs, nil
-	}
-
 	zone = normalizeZone(zone)
 
 	var appended []libdns.Record
@@ -244,10 +238,19 @@ func (p *Provider) AppendRecords(ctx context.Context, zone string, recs []libdns
 			zap.String("zone_param", zone),
 			zap.String("fqdn", fqdn))
 
-		// ipv64.net expects relative label under the managed domain
+		// Check if this is an ipv64.net domain using the FQDN, not the zone parameter
+		// CertMagic sometimes passes incorrect zones (e.g., "ipv64.de" instead of "username.ipv64.de")
 		managed := p.deriveManagedZone(fqdn, zone)
 		if managed == "" {
 			return appended, fmt.Errorf("cannot derive managed zone for %s in zone %s", fqdn, zone)
+		}
+
+		if !isIpv64Domain(managed + ".") {
+			p.logger.Debug("ipv64: skipping non-ipv64 domain",
+				zap.String("zone", zone),
+				zap.String("fqdn", fqdn),
+				zap.String("managed", managed))
+			continue // Skip this record, but continue processing others
 		}
 
 		// Compute relative prefix under managed zone
