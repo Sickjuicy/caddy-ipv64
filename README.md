@@ -69,6 +69,7 @@ example.ipv64.de {
             api_token {env.IPV64_API_TOKEN}
         }
         resolvers 1.1.1.1 8.8.8.8
+        propagation_delay 30s
     }
     respond "Hello"
 }
@@ -102,6 +103,7 @@ example.ipv64.de {
             }
         }
         resolvers 1.1.1.1 8.8.8.8
+        propagation_delay 30s
     }
     respond "Hello"
 }
@@ -230,6 +232,25 @@ and add `ns1.ipv64.net` / `ns2.ipv64.net` as NS records.
 ```bash
 echo -e "nameserver 1.1.1.1\nnameserver 8.8.8.8" > /etc/resolv.conf
 ```
+
+### `No TXT record found` / `During secondary validation`
+Let's Encrypt performs multi-perspective validation from multiple locations. If the TXT record
+hasn't propagated to all LE validation servers yet, validation fails.
+
+**Fix:** Add `propagation_delay 30s` in the `tls` block, **outside** the `dns ipv64` block:
+```caddyfile
+tls {
+    dns ipv64 {
+        api_token {env.IPV64_API_TOKEN}
+    }
+    resolvers 1.1.1.1 8.8.8.8
+    propagation_delay 30s  # <-- gives LE time to reach all perspectives
+}
+```
+
+The plugin's active propagation check confirms the TXT record is visible on ≥2 resolvers before
+returning, but LE's secondary validators may need additional time. `propagation_delay 30s` adds
+a fixed delay after the plugin returns, ensuring global propagation.
 
 ### 429 Rate Limited
 Too many failed authorization attempts. Let's Encrypt limits 5 failures per identifier per hour. Wait ~1 hour or use the staging CA for testing:
