@@ -20,8 +20,8 @@ import (
 //	dns ipv64 {
 //	  api_token ...
 //	  dynip {
-//	    subdomain sick.ipv64.de
-//	    subdomain vpn.sick.ipv64.de
+//	    subdomain example.ipv64.de
+//	    subdomain vpn.example.ipv64.de
 //	    interval 30m
 //	    ipv4_only    # only A records
 //	    # ipv6_only  # only AAAA records
@@ -228,8 +228,8 @@ func (d *DynIPUpdater) fetchIP(ctx context.Context, url string) string {
 
 // setRecord creates an A or AAAA record on ipv64.net for the given subdomain.
 // The subdomain is split into managed zone + prefix for the ipv64.net API.
-// "sick.ipv64.de" → zone="sick.ipv64.de", prefix="@"
-// "vpn.sick.ipv64.de" → zone="sick.ipv64.de", prefix="vpn"
+// "example.ipv64.de" → zone="example.ipv64.de", prefix="@"
+// "vpn.example.ipv64.de" → zone="example.ipv64.de", prefix="vpn"
 func (d *DynIPUpdater) setRecord(ctx context.Context, subdomain, recordType, ip string) {
 	managed := d.provider.deriveManagedZone(subdomain + ".")
 	if managed == "" {

@@ -23,7 +23,7 @@ xcaddy build --with github.com/Sickjuicy/caddy-ipv64@dev
 
 ### Minimal Config
 ```caddyfile
-sick.ipv64.de {
+example.ipv64.de {
     tls {
         dns ipv64 {
             api_token {env.IPV64_API_TOKEN}
@@ -35,7 +35,7 @@ sick.ipv64.de {
 
 ### Full Config (DNS-01 + DynIP)
 ```caddyfile
-sick.ipv64.de {
+example.ipv64.de {
     tls {
         dns ipv64 {
             api_token {env.IPV64_API_TOKEN}
@@ -52,8 +52,8 @@ sick.ipv64.de {
 
             # Optional: DynDNS IP updates
             dynip {
-                subdomain sick.ipv64.de
-                subdomain vpn.sick.ipv64.de
+                subdomain example.ipv64.de
+                subdomain vpn.example.ipv64.de
                 interval 30m
                 # ipv4_only     # only A records
                 # ipv6_only     # only AAAA records
@@ -129,7 +129,7 @@ go test -v -count=1 -timeout 60s ./...
 ### Full Lifecycle Test (needs API token)
 ```powershell
 $env:IPV64_API_TOKEN = "your_token"
-.\tests\run-lifecycle-test.ps1 -Domain "sick.ipv64.de"
+.\tests\run-lifecycle-test.ps1 -Domain "example.ipv64.de"
 ```
 
 This tests: build → cert obtain → automatic renewal → DynIP record creation.
