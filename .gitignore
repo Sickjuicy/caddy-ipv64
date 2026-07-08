@@ -48,12 +48,27 @@ temp/
 /caddy_*
 /bin/
 /dist/
+
+# Generated test configs (created by run-integration-test.ps1)
+tests/Caddyfile.test
+Caddyfile.individual
+Caddyfile.wildcard
+Caddyfile.test
 /build/
 /out/
 
 # caddy test files
 /caddy-test/
 /cmd/
+tests/Caddyfile.cert
+tests/Caddyfile.dynip
+tests/Caddyfile.single
+tests/Caddyfile.staging
+tests/Caddyfile.wildcard-sub
+tests/Caddyfile.wildcard-subsub
+tests/Caddyfile.wildcard-test
+tests/integration_test.go
+tests/run-integration-test.ps1
 
 # Local main wrapper (keep out of git)
 /cmd/caddy-ipv64/
@@ -61,4 +76,17 @@ temp/
 # Optional: local Caddy runtime data if created inside repo (usually outside)
 autosave.json
 .caddy/
-.github
+
+# Local knowledge files (NOT committed to git - local reference only)
+LOCAL_KNOWLEDGE.md
+LOCAL_TIPS.md
+
+# Additional non-tracked files
+*.local
+.env.local
+config.local*
+.github/copilot-instructions.md
+tests/Caddyfile.dynip-test
+tests/Caddyfile.lifecycle
+tests/make_short_cert.go
+tests/run-lifecycle-test.ps1

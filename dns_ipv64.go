@@ -5,9 +5,12 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
+	"slices"
+	"strconv"
 	"strings"
 	"time"
 
@@ -18,74 +21,53 @@ import (
 )
 
 const (
-	// API Configuration
-	apiEndpoint = "https://ipv64.net/api"
+	apiEndpoint string = "https://ipv64.net/api"
 
-	// Default Provider Settings
-	defaultTimeout       = 30 // seconds
-	defaultMaxRetries    = 5
-	defaultBackoffMillis = 500 // milliseconds
+	DefaultTimeoutSeconds       = 30
+	DefaultMaxRetries          = 5
+	DefaultInitialBackoffMillis = 500
 
-	// HTTP Status Codes
+	// DNS propagation checking: poll resolvers until the TXT record is visible.
+	// Faster than a blind delay (best case ~10s) and more reliable (waits
+	// longer if propagation is slow). LE uses multi-perspective validation.
+	DefaultPropagationTimeoutSec = 60
+	DefaultPropagationPollSec    = 5
+	propagationMinDelay          = 10 * time.Second // let ipv64.net process before first poll
+
 	statusTooManyRequests = 429
 	statusServerErrorMin  = 500
 )
 
 var (
-	// Default DNS resolvers (ipv64.net nameservers first, then public DNS)
-	defaultResolvers = []string{
-		"ns1.ipv64.net:53",
-		"ns2.ipv64.net:53",
-		"1.1.1.1:53",
-		"8.8.8.8:53",
-	}
-
-	// Known ipv64.net service names (second-to-last part of domain)
-	// Current as of October 2025 - see https://ipv64.net for latest list
-	// Format: username.<service>.de or username.<service>.net
-	knownServices = []string{
-		"ipv64",    // ipv64.de, ipv64.net - Main service
-		"any64",    // any64.de - Generic service
-		"api64",    // api64.de - API service
-		"dns64",    // dns64.de - DNS service
-		"dyndns64", // dyndns64.de - DynDNS service
-		"dynipv6",  // dynipv6.de - IPv6 DynDNS (exception: doesn't end in "64")
-		"eth64",    // eth64.de - Ethernet service
-		"home64",   // home64.de - Home service
-		"iot64",    // iot64.de - IoT service
-		"lan64",    // lan64.de - LAN service
-		"nas64",    // nas64.de - NAS service
-		"root64",   // root64.de - Root service
-		"route64",  // route64.de - Routing service
-		"srv64",    // srv64.de - Server service
-		"tcp64",    // tcp64.de - TCP service
-		"udp64",    // udp64.de - UDP service
-		"vpn64",    // vpn64.de, vpn64.net - VPN service
-		"wan64",    // wan64.de - WAN service
-	}
-
-	// Supported TLDs for ipv64.net services
-	supportedTLDs = []string{"de", "net"}
+	defaultResolvers = []string{"ns1.ipv64.net:53", "ns2.ipv64.net:53"}
+	knownServices    = []string{"ipv64", "any64", "api64", "dns64", "dyndns64", "dynipv6", "eth64", "home64", "iot64", "lan64", "nas64", "root64", "route64", "srv64", "tcp64", "udp64", "vpn64", "wan64"}
+	supportedTLDs    = []string{"de", "net"}
 )
 
 // Provider implements the libdns.Provider interface for ipv64.net DNS-01 ACME challenges.
-// It also serves as a Caddy module (dns.providers.ipv64).
 type Provider struct {
-	// API Configuration
 	Token                string `json:"api_token,omitempty" caddy:"namespace=dns.providers.ipv64"`
 	TimeoutSeconds       int    `json:"timeout_seconds,omitempty"`
 	MaxRetries           int    `json:"max_retries,omitempty"`
 	InitialBackoffMillis int    `json:"initial_backoff_ms,omitempty"`
 
-	// DNS Resolver Configuration
+	// PropagationTimeoutSec is the max time to wait for DNS propagation
+	// after creating a TXT record. Set to 0 to disable. Default: 60.
+	PropagationTimeoutSec int `json:"propagation_timeout_seconds,omitempty"`
+	// PropagationPollSec is the seconds between DNS propagation checks. Default: 5.
+	PropagationPollSec int `json:"propagation_poll_interval,omitempty"`
+
 	Resolvers []string `json:"resolvers,omitempty"`
 
-	// Internal state
+	// DynIP enables optional DynDNS IP updates. When set, the provider
+	// periodically updates A/AAAA records on ipv64.net.
+	DynIP *DynIPUpdater `json:"dynip,omitempty"`
+
 	httpClient *http.Client
 	logger     *zap.Logger
+	endpoint   string
 }
 
-// CaddyModule returns the Caddy module information.
 func (Provider) CaddyModule() caddy.ModuleInfo {
 	return caddy.ModuleInfo{
 		ID:  "dns.providers.ipv64",
@@ -93,268 +75,160 @@ func (Provider) CaddyModule() caddy.ModuleInfo {
 	}
 }
 
-// Provision sets up the provider with defaults and validates configuration.
 func (p *Provider) Provision(ctx caddy.Context) error {
 	p.logger = ctx.Logger(p)
-
-	// Get API token from config or environment
 	if p.Token == "" {
 		p.Token = os.Getenv("IPV64_API_TOKEN")
 	}
-
-	// Set defaults using constants
 	if p.TimeoutSeconds <= 0 {
-		p.TimeoutSeconds = defaultTimeout
+		p.TimeoutSeconds = DefaultTimeoutSeconds
 	}
 	if p.MaxRetries <= 0 {
-		p.MaxRetries = defaultMaxRetries
+		p.MaxRetries = DefaultMaxRetries
 	}
 	if p.InitialBackoffMillis <= 0 {
-		p.InitialBackoffMillis = defaultBackoffMillis
+		p.InitialBackoffMillis = DefaultInitialBackoffMillis
+	}
+	if p.PropagationTimeoutSec == 0 {
+		p.PropagationTimeoutSec = DefaultPropagationTimeoutSec
+	}
+	if p.PropagationPollSec <= 0 {
+		p.PropagationPollSec = DefaultPropagationPollSec
 	}
 
-	// Initialize HTTP client once
-	p.httpClient = &http.Client{
-		Timeout: time.Duration(p.TimeoutSeconds) * time.Second,
-	}
+	p.httpClient = &http.Client{Timeout: time.Duration(p.TimeoutSeconds) * time.Second}
+	p.endpoint = apiEndpoint
 
-	// Set default resolvers if not configured
 	if len(p.Resolvers) == 0 {
 		p.Resolvers = defaultResolvers
-		p.logger.Info("ipv64: using default resolvers (ipv64 nameservers + public DNS)")
 	} else {
-		// Normalize custom resolvers (add :53 port if missing)
 		for i, r := range p.Resolvers {
 			if !strings.Contains(r, ":") {
 				p.Resolvers[i] = r + ":53"
 			}
 		}
-
-		// Warn if ipv64 nameservers are missing
-		hasIpv64NS := false
-		for _, r := range p.Resolvers {
-			if strings.Contains(r, "ns1.ipv64.net") || strings.Contains(r, "ns2.ipv64.net") {
-				hasIpv64NS = true
-				break
-			}
-		}
-		if !hasIpv64NS {
-			p.logger.Warn("ipv64: custom resolvers missing ipv64.net nameservers - may cause DNS propagation issues",
-				zap.Strings("resolvers", p.Resolvers))
+		if !hasIpv64NS(p.Resolvers) {
+			p.logger.Warn("ipv64: custom resolvers missing ipv64.net nameservers - may cause DNS propagation issues", zap.Strings("resolvers", p.Resolvers))
 		}
 	}
 
 	p.logger.Info("ipv64 DNS provider provisioned",
 		zap.Int("max_retries", p.MaxRetries),
 		zap.Int("timeout_seconds", p.TimeoutSeconds),
-		zap.Int("initial_backoff_millis", p.InitialBackoffMillis),
+		zap.Int("propagation_timeout_seconds", p.PropagationTimeoutSec),
+		zap.Int("propagation_poll_interval", p.PropagationPollSec),
 		zap.Strings("resolvers", p.Resolvers),
-	)
+		zap.Bool("dynip_enabled", p.DynIP != nil))
 
-	// Warn users about recommended TLS settings for reliable certificate issuance
-	p.logger.Warn("ipv64: IMPORTANT - For reliable wildcard certificates, configure in your Caddyfile:",
-		zap.String("propagation_delay", "15s (slower checks = more time before deletion)"),
-		zap.String("propagation_timeout", "90s (ipv64.net DNS propagation time)"),
-		zap.String("resolvers", "ns1.ipv64.net ns2.ipv64.net 1.1.1.1 8.8.8.8"),
-		zap.String("example", "See README.md for complete configuration"),
-	)
+	if p.DynIP != nil {
+		if err := p.DynIP.Provision(ctx, p); err != nil {
+			return err
+		}
+		p.DynIP.Start(ctx)
+	}
 
 	return nil
 }
 
-// Validate ensures the API token is configured.
 func (p *Provider) Validate() error {
 	if p.Token == "" {
-		return errors.New("api_token is required (or set IPV64_API_TOKEN)")
+		return errors.New("api_token is required")
 	}
 	return nil
 }
 
-// isIpv64Domain checks if a zone matches the ipv64.net domain pattern.
-// Valid patterns: username.ipv64.de, username.vpn64.net, username.dynipv6.de, etc.
-// Requires at least 3 parts, second-to-last is a known service name, TLD is in supportedTLDs.
-//
-// Uses an explicit list of known services instead of pattern matching for:
-//   - Explicit validation (no false positives)
-//   - Easy maintenance (add new services to knownServices list)
-//   - Clear documentation (list shows all supported services)
-//
-// To add support for new ipv64.net services, update the knownServices variable.
-func isIpv64Domain(zone string) bool {
-	parts := strings.Split(strings.TrimSuffix(zone, "."), ".")
-	if len(parts) < 3 {
-		return false
-	}
+// --- Setters for testing ---
 
-	// Check if second-to-last part is a known ipv64.net service
-	service := parts[len(parts)-2]
-	tld := parts[len(parts)-1]
+func (p *Provider) SetEndpoint(endpoint string)  { p.endpoint = endpoint }
+func (p *Provider) SetHttpClient(c *http.Client)  { p.httpClient = c }
+func (p *Provider) SetLogger(l *zap.Logger)       { p.logger = l }
+func (p *Provider) SetMaxRetries(n int)           { p.MaxRetries = n }
+func (p *Provider) SetInitialBackoffMillis(ms int) { p.InitialBackoffMillis = ms }
 
-	// Check if service is in the known services list
-	serviceFound := false
-	for _, knownService := range knownServices {
-		if service == knownService {
-			serviceFound = true
-			break
-		}
-	}
-	if !serviceFound {
-		return false
-	}
+// --- libdns.Provider interface ---
 
-	// Check if TLD is supported
-	for _, supportedTLD := range supportedTLDs {
-		if tld == supportedTLD {
-			return true
-		}
-	}
-
-	return false
-}
-
-// SetResolvers can be used by tests to override resolvers.
-func (p *Provider) SetResolvers(resolvers []string) {
-	p.Resolvers = resolvers
-}
-
-// AppendRecords creates TXT records for ACME DNS-01 challenges.
-// This is the primary method used by Caddy's ACME automation.
 func (p *Provider) AppendRecords(ctx context.Context, zone string, recs []libdns.Record) ([]libdns.Record, error) {
 	if err := p.Validate(); err != nil {
 		return nil, err
 	}
 
-	zone = normalizeZone(zone)
-
 	var appended []libdns.Record
 	for _, r := range recs {
 		rr := r.RR()
 		fqdn := libdns.AbsoluteName(rr.Name, zone)
-		value := rr.Data
 
-		// DEBUG: Log input parameters
-		p.logger.Debug("ipv64: AppendRecords called",
-			zap.String("record_name", rr.Name),
-			zap.String("zone_param", zone),
-			zap.String("fqdn", fqdn))
-
-		// Check if this is an ipv64.net domain using the FQDN, not the zone parameter
-		// CertMagic sometimes passes incorrect zones (e.g., "ipv64.de" instead of "username.ipv64.de")
-		managed := p.deriveManagedZone(fqdn, zone)
+		managed := p.deriveManagedZone(fqdn)
 		if managed == "" {
-			return appended, fmt.Errorf("cannot derive managed zone for %s in zone %s", fqdn, zone)
+			p.logger.Warn("ipv64: skipping non-ipv64 domain", zap.String("fqdn", fqdn), zap.String("zone", zone))
+			continue
 		}
 
-		if !isIpv64Domain(managed + ".") {
-			p.logger.Debug("ipv64: skipping non-ipv64 domain",
-				zap.String("zone", zone),
-				zap.String("fqdn", fqdn),
-				zap.String("managed", managed))
-			continue // Skip this record, but continue processing others
-		}
-
-		// Compute relative prefix under managed zone
 		prefix := p.computePrefix(fqdn, managed)
 
-		p.logger.Info("ipv64: creating DNS challenge record",
-			zap.String("fqdn", fqdn),
-			zap.String("zone", zone),
-			zap.String("managed", managed),
-			zap.String("prefix", prefix),
-			zap.String("value", value))
-
-		// Use ipv64.net API format (note: "praefix" is the German spelling used by the API)
-		formData := url.Values{}
-		formData.Set("add_record", managed)
-		formData.Set("praefix", prefix)
-		formData.Set("type", "TXT")
-		formData.Set("content", value)
-
-		err := p.doWithRetryForm(ctx, p.httpClient, http.MethodPost, apiEndpoint, formData)
-		if err != nil {
+		if err := p.apiCall(ctx, http.MethodPost, "add_record", managed, prefix, rr.Data); err != nil {
 			return appended, err
 		}
 		appended = append(appended, r)
-		p.logger.Info("ipv64: DNS record created successfully", zap.String("fqdn", fqdn), zap.String("zone", managed))
+		p.logger.Info("ipv64: DNS record created", zap.String("fqdn", fqdn), zap.String("zone", managed))
+
+		if p.PropagationTimeoutSec > 0 {
+			p.waitForPropagation(ctx, fqdn, rr.Data)
+		}
 	}
 
 	return appended, nil
 }
 
-// DeleteRecords removes TXT records after ACME validation completes.
 func (p *Provider) DeleteRecords(ctx context.Context, zone string, recs []libdns.Record) ([]libdns.Record, error) {
 	if err := p.Validate(); err != nil {
 		return nil, err
 	}
 
-	zone = normalizeZone(zone)
-
 	var deleted []libdns.Record
 	for _, r := range recs {
 		rr := r.RR()
 		fqdn := libdns.AbsoluteName(rr.Name, zone)
-		value := rr.Data
 
-		// Derive the actual managed zone from the FQDN
-		managed := p.deriveManagedZone(fqdn, zone)
+		managed := p.deriveManagedZone(fqdn)
 		if managed == "" {
-			p.logger.Debug("ipv64: cannot derive managed zone for deletion",
-				zap.String("fqdn", fqdn),
-				zap.String("zone", zone))
-			continue
-		}
-
-		// Validate that this is an ipv64.net domain using the derived managed zone
-		if !isIpv64Domain(managed + ".") {
-			p.logger.Debug("ipv64: skipping non-ipv64 domain for deletion",
-				zap.String("zone", zone),
-				zap.String("fqdn", fqdn),
-				zap.String("managed", managed))
 			continue
 		}
 
 		prefix := p.computePrefix(fqdn, managed)
 
-		formData := url.Values{}
-		formData.Set("del_record", managed)
-		formData.Set("praefix", prefix)
-		formData.Set("type", "TXT")
-		formData.Set("content", value)
-
-		p.logger.Debug("ipv64: DNS delete details",
-			zap.String("fqdn", fqdn),
-			zap.String("zone", zone),
-			zap.String("managed", managed),
-			zap.String("prefix", prefix),
-			zap.String("value", value))
-
-		if err := p.doWithRetryForm(ctx, p.httpClient, http.MethodDelete, apiEndpoint, formData); err != nil {
-			p.logger.Warn("ipv64: failed to delete DNS record (may already be gone)",
-				zap.Error(err),
-				zap.String("fqdn", fqdn))
+		if err := p.apiCall(ctx, http.MethodDelete, "del_record", managed, prefix, rr.Data); err != nil {
+			p.logger.Warn("ipv64: failed to delete DNS record (may already be gone)", zap.Error(err), zap.String("fqdn", fqdn))
 		} else {
-			p.logger.Info("ipv64: DNS record deleted successfully",
-				zap.String("fqdn", fqdn),
-				zap.String("zone", managed))
+			p.logger.Info("ipv64: DNS record deleted", zap.String("fqdn", fqdn), zap.String("zone", managed))
 		}
 		deleted = append(deleted, r)
 	}
 	return deleted, nil
 }
 
-// doWithRetryForm performs HTTP requests with exponential backoff retry logic.
-// Retries on network errors, 5xx server errors, and 429 rate limiting.
-func (p *Provider) doWithRetryForm(ctx context.Context, client *http.Client, method, apiURL string, formData url.Values) error {
+func (p *Provider) GetRecords(ctx context.Context, zone string) ([]libdns.Record, error) {
+	return nil, nil
+}
+
+func (p *Provider) SetRecords(ctx context.Context, zone string, recs []libdns.Record) ([]libdns.Record, error) {
+	return nil, errors.New("SetRecords not implemented")
+}
+
+// --- API client ---
+
+// apiCall sends a form-encoded request to the ipv64.net API with retry logic.
+func (p *Provider) apiCall(ctx context.Context, method, action, zone, prefix, content string) error {
+	form := url.Values{}
+	form.Set(action, zone)
+	form.Set("praefix", prefix)
+	form.Set("type", "TXT")
+	form.Set("content", content)
+
 	var lastErr error
 	backoff := time.Duration(p.InitialBackoffMillis) * time.Millisecond
 
 	for attempt := 0; attempt <= p.MaxRetries; attempt++ {
 		if attempt > 0 {
-			p.logger.Debug("ipv64: retrying API request",
-				zap.Int("attempt", attempt),
-				zap.Int("max_retries", p.MaxRetries),
-				zap.Duration("backoff", backoff),
-			)
 			select {
 			case <-time.After(backoff):
 			case <-ctx.Done():
@@ -363,124 +237,160 @@ func (p *Provider) doWithRetryForm(ctx context.Context, client *http.Client, met
 			backoff *= 2
 		}
 
-		req, err := http.NewRequestWithContext(ctx, method, apiURL, strings.NewReader(formData.Encode()))
+		req, err := http.NewRequestWithContext(ctx, method, p.endpoint, strings.NewReader(form.Encode()))
 		if err != nil {
 			return fmt.Errorf("creating request: %w", err)
 		}
-
 		req.Header.Set("Authorization", "Bearer "+p.Token)
 		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 
-		resp, err := client.Do(req)
+		resp, err := p.httpClient.Do(req)
 		if err != nil {
 			lastErr = err
-			p.logger.Warn("ipv64: API request failed (network error)",
-				zap.Error(err),
-				zap.Int("attempt", attempt+1),
-			)
 			continue
 		}
-		defer resp.Body.Close()
 
 		body, err := io.ReadAll(resp.Body)
+		resp.Body.Close()
 		if err != nil {
 			lastErr = fmt.Errorf("reading response body: %w", err)
-			p.logger.Warn("ipv64: failed to read response body",
-				zap.Error(err),
-				zap.Int("attempt", attempt+1),
-			)
 			continue
 		}
 
-		// Success
 		if resp.StatusCode >= 200 && resp.StatusCode < 300 {
-			p.logger.Debug("ipv64: API request successful",
-				zap.Int("status", resp.StatusCode),
-				zap.String("response", string(body)),
-			)
 			return nil
 		}
 
-		// Retryable errors (5xx server errors or rate limiting)
 		if resp.StatusCode >= statusServerErrorMin || resp.StatusCode == statusTooManyRequests {
 			lastErr = fmt.Errorf("ipv64 API error (status: %s): %s", resp.Status, string(body))
-			p.logger.Warn("ipv64: API returned retryable error",
-				zap.Int("status", resp.StatusCode),
-				zap.String("body", string(body)),
-				zap.Int("attempt", attempt+1),
-			)
 			continue
 		}
 
-		// Non-retryable error
 		return fmt.Errorf("ipv64 API error (status: %s): %s", resp.Status, string(body))
 	}
 
 	return fmt.Errorf("max retries (%d) exceeded: %w", p.MaxRetries, lastErr)
 }
 
-// deriveManagedZone finds the managed ipv64.net zone for a given FQDN.
-// It searches for the *64.de or *64.net pattern (e.g., yourdomain.ipv64.de).
-// Examples:
-//   - _acme-challenge.app.yourdomain.ipv64.de -> yourdomain.ipv64.de
-//   - subdomain.yourdomain.ipv64.de -> yourdomain.ipv64.de
-//   - yourdomain.ipv64.de -> yourdomain.ipv64.de
-//
-// NOTE: The 'zone' parameter is IGNORED because CertMagic sometimes passes incorrect zones
-// (e.g., "ipv64.de" instead of "sickcloud.ipv64.de"). We derive the zone from the FQDN only.
-func (p *Provider) deriveManagedZone(fqdn, zone string) string {
+// --- DNS propagation checking ---
+
+// waitForPropagation polls DNS resolvers until the TXT record is visible on
+// at least 2 resolvers, or the timeout is reached. Non-fatal on timeout.
+func (p *Provider) waitForPropagation(ctx context.Context, fqdn, expectedValue string) {
+	select {
+	case <-time.After(propagationMinDelay):
+	case <-ctx.Done():
+		return
+	}
+
+	fqdnClean := strings.TrimSuffix(fqdn, ".")
+	deadline := time.Now().Add(time.Duration(p.PropagationTimeoutSec) * time.Second)
+	interval := time.Duration(p.PropagationPollSec) * time.Second
+
+	for time.Now().Before(deadline) {
+		visible := 0
+		for _, resolver := range p.Resolvers {
+			if p.checkTXT(ctx, resolver, fqdnClean, expectedValue) {
+				visible++
+			}
+		}
+
+		if visible >= 2 {
+			p.logger.Info("ipv64: DNS propagation confirmed",
+				zap.Int("visible_resolvers", visible),
+				zap.String("fqdn", fqdnClean))
+			return
+		}
+
+		select {
+		case <-time.After(interval):
+		case <-ctx.Done():
+			return
+		}
+	}
+
+	p.logger.Warn("ipv64: DNS propagation timeout, continuing anyway", zap.String("fqdn", fqdnClean))
+}
+
+// checkTXT queries a specific DNS resolver for the expected TXT record value.
+func (p *Provider) checkTXT(ctx context.Context, resolver, fqdn, expectedValue string) bool {
+	addr := strings.TrimSuffix(resolver, ":53")
+	if !strings.Contains(addr, ":") {
+		addr = addr + ":53"
+	}
+
+	r := &net.Resolver{
+		PreferGo: true,
+		Dial: func(ctx context.Context, _, _ string) (net.Conn, error) {
+			d := net.Dialer{Timeout: 5 * time.Second}
+			return d.DialContext(ctx, "udp", addr)
+		},
+	}
+
+	lookupCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+
+	txts, err := r.LookupTXT(lookupCtx, fqdn)
+	if err != nil {
+		return false
+	}
+	return slices.Contains(txts, expectedValue)
+}
+
+// --- Domain parsing ---
+
+// deriveManagedZone extracts the ipv64.net managed zone from an FQDN.
+// Example: "_acme-challenge.test.user.ipv64.de" → "user.ipv64.de"
+func (p *Provider) deriveManagedZone(fqdn string) string {
 	fqdn = strings.TrimSuffix(fqdn, ".")
+	fqdn = strings.TrimPrefix(fqdn, "_acme-challenge.")
 
-	// Remove _acme-challenge prefix for cleaner pattern matching
-	workingFqdn := strings.TrimPrefix(fqdn, "_acme-challenge.")
-
-	// Search from right to left for *64.de or *64.net pattern
-	parts := strings.Split(workingFqdn, ".")
-	// Need at least 3 parts for username.service64.tld (e.g., yourdomain.ipv64.de)
-	// Start from len(parts)-3 to ensure we have enough parts
-	for i := len(parts) - 3; i >= 0; i-- {
+	parts := strings.Split(fqdn, ".")
+	for i := len(parts) - 1; i >= 0; i-- {
 		candidate := strings.Join(parts[i:], ".")
 		if isIpv64Domain(candidate + ".") {
 			return candidate
 		}
 	}
-
-	// Fallback: use the working FQDN as-is
-	return workingFqdn
+	return ""
 }
 
-// computePrefix calculates the relative DNS prefix under the managed zone.
-// Examples:
-//   - FQDN: _acme-challenge.app.yourdomain.ipv64.de, Managed: yourdomain.ipv64.de -> "_acme-challenge.app"
-//   - FQDN: yourdomain.ipv64.de, Managed: yourdomain.ipv64.de -> "@"
+// computePrefix calculates the relative prefix for the ipv64.net API.
+// Example: "_acme-challenge.test.user.ipv64.de" with zone "user.ipv64.de" → "_acme-challenge.test"
 func (p *Provider) computePrefix(fqdn, managed string) string {
-	fqdnClean := strings.TrimSuffix(fqdn, ".")
-	managedClean := strings.TrimSuffix(managed, ".")
+	fqdn = strings.TrimSuffix(fqdn, ".")
+	managed = strings.TrimSuffix(managed, ".")
 
-	// Root domain case
-	if fqdnClean == managedClean {
+	if fqdn == managed {
 		return "@"
 	}
-
-	// Subdomain case: strip managed zone suffix
-	if strings.HasSuffix(fqdnClean, "."+managedClean) {
-		return strings.TrimSuffix(fqdnClean, "."+managedClean)
-	}
-
-	// Fallback: return first label
-	parts := strings.Split(fqdnClean, ".")
-	return parts[0]
+	return strings.TrimSuffix(fqdn, "."+managed)
 }
 
-// normalizeZone ensures zone names end with a dot for libdns compatibility.
-func normalizeZone(z string) string {
-	if !strings.HasSuffix(z, ".") {
-		z += "."
+// isIpv64Domain checks if a domain belongs to the ipv64.net service.
+// Both the service label (e.g. "ipv64") AND the TLD (e.g. "de") must match.
+func isIpv64Domain(domain string) bool {
+	parts := strings.Split(strings.TrimSuffix(domain, "."), ".")
+	if len(parts) < 3 {
+		return false
 	}
-	return z
+	service := parts[len(parts)-2]
+	tld := parts[len(parts)-1]
+	return slices.Contains(knownServices, service) && slices.Contains(supportedTLDs, tld)
 }
 
-// UnmarshalCaddyfile implements caddyfile unmarshalling.
+// hasIpv64NS checks if any resolver contains ipv64.net nameservers.
+func hasIpv64NS(resolvers []string) bool {
+	for _, r := range resolvers {
+		if strings.Contains(r, "ns1.ipv64.net") || strings.Contains(r, "ns2.ipv64.net") {
+			return true
+		}
+	}
+	return false
+}
+
+// --- Caddyfile parsing ---
+
 func (p *Provider) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 	for d.Next() {
 		for d.NextBlock(0) {
@@ -491,53 +401,44 @@ func (p *Provider) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 				}
 				p.Token = d.Val()
 			case "resolver":
-				// one or many
 				for d.NextArg() {
 					p.Resolvers = append(p.Resolvers, d.Val())
 				}
 			case "timeout_seconds":
-				if !d.NextArg() {
-					return d.ArgErr()
-				}
-				var v int
-				if _, err := fmt.Sscanf(d.Val(), "%d", &v); err != nil || v < 0 {
-					return d.Errf("invalid timeout_seconds: %s", d.Val())
-				}
-				p.TimeoutSeconds = v
+				p.TimeoutSeconds = parseIntArg(d)
 			case "max_retries":
-				if !d.NextArg() {
-					return d.ArgErr()
-				}
-				var v int
-				if _, err := fmt.Sscanf(d.Val(), "%d", &v); err != nil || v < 0 {
-					return d.Errf("invalid max_retries: %s", d.Val())
-				}
-				p.MaxRetries = v
+				p.MaxRetries = parseIntArg(d)
 			case "initial_backoff_ms":
-				if !d.NextArg() {
-					return d.ArgErr()
+				p.InitialBackoffMillis = parseIntArg(d)
+			case "propagation_timeout_seconds":
+				p.PropagationTimeoutSec = parseIntArg(d)
+			case "propagation_poll_interval":
+				p.PropagationPollSec = parseIntArg(d)
+			case "dynip":
+				p.DynIP = &DynIPUpdater{}
+				if err := p.DynIP.UnmarshalCaddyfile(d); err != nil {
+					return err
 				}
-				var v int
-				if _, err := fmt.Sscanf(d.Val(), "%d", &v); err != nil || v < 0 {
-					return d.Errf("invalid initial_backoff_ms: %s", d.Val())
-				}
-				p.InitialBackoffMillis = v
 			}
 		}
 	}
 	return nil
 }
 
+// parseIntArg reads the next argument as a non-negative integer, or returns an error.
+func parseIntArg(d *caddyfile.Dispenser) int {
+	if !d.NextArg() {
+		d.ArgErr()
+		return 0
+	}
+	v, err := strconv.Atoi(d.Val())
+	if err != nil || v < 0 {
+		d.Errf("invalid value: %s", d.Val())
+		return 0
+	}
+	return v
+}
+
 func init() {
 	caddy.RegisterModule(Provider{})
-}
-
-// GetRecords is optional for ACME and returns empty result (not required for issuance).
-func (p *Provider) GetRecords(ctx context.Context, zone string) ([]libdns.Record, error) {
-	return nil, nil
-}
-
-// SetRecords is not implemented; ACME flow uses Append/Delete.
-func (p *Provider) SetRecords(ctx context.Context, zone string, recs []libdns.Record) ([]libdns.Record, error) {
-	return nil, fmt.Errorf("SetRecords not implemented")
 }
