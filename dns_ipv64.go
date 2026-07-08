@@ -399,7 +399,7 @@ func (p *Provider) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 				if !d.NextArg() {
 					return d.ArgErr()
 				}
-				p.Token = d.Val()
+				p.Token = expandEnv(d.Val())
 			case "resolver":
 				for d.NextArg() {
 					p.Resolvers = append(p.Resolvers, d.Val())
@@ -437,6 +437,27 @@ func parseIntArg(d *caddyfile.Dispenser) int {
 		return 0
 	}
 	return v
+}
+
+// expandEnv replaces {env.VAR_NAME} patterns with the corresponding environment variable value.
+// This allows Caddyfile users to reference environment variables in the dns ipv64 block,
+// e.g.: api_token {env.IPV64_API_TOKEN}
+func expandEnv(s string) string {
+	for {
+		idx := strings.Index(s, "{env.")
+		if idx == -1 {
+			break
+		}
+		end := strings.Index(s[idx:], "}")
+		if end == -1 {
+			break
+		}
+		end += idx
+		varName := s[idx+5 : end] // skip "{env."
+		envVal := os.Getenv(varName)
+		s = s[:idx] + envVal + s[end+1:]
+	}
+	return s
 }
 
 func init() {
