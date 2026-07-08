@@ -2,6 +2,8 @@
 
 Caddy v2 DNS provider module for [ipv64.net](https://ipv64.net) — DNS-01 ACME challenges for wildcard SSL certificates and optional DynDNS IP updates.
 
+> **Note:** If you use internal DNS servers (e.g. Technitium), see [Troubleshooting — `no such host`](#no-such-host-for-nameservers) for required DNS configuration.
+
 ## Features
 
 - **DNS-01 ACME Challenges** — individual domains, wildcards, sub-subdomains
@@ -15,9 +17,47 @@ Caddy v2 DNS provider module for [ipv64.net](https://ipv64.net) — DNS-01 ACME 
 
 ## Installation
 
+**Production (stable release):**
+```bash
+xcaddy build --with github.com/Sickjuicy/caddy-ipv64@latest
+```
+
+**Development branch:**
 ```bash
 xcaddy build --with github.com/Sickjuicy/caddy-ipv64@dev
 ```
+
+## Environment Variables
+
+The plugin reads the API token from the `IPV64_API_TOKEN` environment variable if not set in the Caddyfile.
+
+**systemd (recommended):**
+```bash
+sudo systemctl edit caddy
+```
+```ini
+[Service]
+Environment=IPV64_API_TOKEN=your_token_here
+```
+
+**Or with a .env file:**
+```ini
+[Service]
+EnvironmentFile=/etc/caddy/.env
+```
+```bash
+# /etc/caddy/.env (no quotes, no spaces around =):
+IPV64_API_TOKEN=your_token_here
+```
+
+> **Note:** On some systemd versions, `EnvironmentFile=` may not work with `ProtectSystem=full`.
+> If the variable is empty, use `Environment=` instead (see above).
+
+**Caddyfile usage:**
+```caddyfile
+api_token {env.IPV64_API_TOKEN}
+```
+The plugin substitutes `{env.VAR_NAME}` patterns automatically.
 
 ## Quick Start
 
@@ -28,6 +68,7 @@ example.ipv64.de {
         dns ipv64 {
             api_token {env.IPV64_API_TOKEN}
         }
+        resolvers 1.1.1.1 8.8.8.8
     }
     respond "Hello"
 }
@@ -60,6 +101,7 @@ example.ipv64.de {
                 # dslite        # DS-Lite: IPv6 only, skip IPv4 detection
             }
         }
+        resolvers 1.1.1.1 8.8.8.8
     }
     respond "Hello"
 }
@@ -149,6 +191,62 @@ This tests: build → cert obtain → automatic renewal → DynIP record creatio
 `ipv64`, `any64`, `api64`, `dns64`, `dyndns64`, `dynipv6`, `eth64`, `home64`, `iot64`, `lan64`, `nas64`, `root64`, `route64`, `srv64`, `tcp64`, `udp64`, `vpn64`, `wan64`
 
 Supported TLDs: `.de`, `.net`
+
+## Troubleshooting
+
+### 401 Unauthorized
+The API token is wrong or expired. Test it directly:
+```bash
+curl -s -H "Authorization: Bearer YOUR_TOKEN" \
+  -d "add_record=example.ipv64.de&praefix=test&type=TXT&content=hello" \
+  https://ipv64.net/api
+```
+If this returns `401`, the token is invalid. Generate a new one at ipv64.net.
+
+### `{env.IPV64_API_TOKEN}` not substituted
+The plugin substitutes `{env.VAR}` patterns in the `api_token` field. Ensure the variable is set in the environment (see [Environment Variables](#environment-variables)).
+
+### `no such host` for nameservers
+Caddy's CertMagic does its own DNS propagation check **after** the plugin creates the TXT record.
+If the SOA/NS records of your ipv64.net subdomain point to non-resolvable nameservers (e.g. `technitiumdns.`),
+Caddy's check will fail even though the plugin already confirmed propagation.
+
+**Fix 1 — Caddyfile:** Add `resolvers 1.1.1.1 8.8.8.8` in the `tls` block, **outside** the `dns ipv64` block:
+```caddyfile
+tls {
+    dns ipv64 {
+        api_token {env.IPV64_API_TOKEN}
+    }
+    resolvers 1.1.1.1 8.8.8.8  # <-- fixes Caddy's DNS check
+}
+```
+
+**Fix 2 — DNS SOA/NS records:** Ensure the SOA and NS records for your ipv64.net subdomain
+point to `ns1.ipv64.net` / `ns2.ipv64.net` (publicly resolvable), not to internal nameservers.
+If you use a local DNS server like Technitium, change the SOA primary NS to `ns1.ipv64.net`
+and add `ns1.ipv64.net` / `ns2.ipv64.net` as NS records.
+
+**Fix 3 — System resolvers:** If Caddy still fails, set your system resolvers to public DNS:
+```bash
+echo -e "nameserver 1.1.1.1\nnameserver 8.8.8.8" > /etc/resolv.conf
+```
+
+### 429 Rate Limited
+Too many failed authorization attempts. Let's Encrypt limits 5 failures per identifier per hour. Wait ~1 hour or use the staging CA for testing:
+```caddyfile
+{
+    acme_ca https://acme-staging-v02.api.letsencrypt.org/directory
+}
+```
+
+### Certificate not obtained but no errors
+Caddy may be in a backoff state from previous failures. Reset ACME state:
+example:
+```bash
+sudo systemctl stop caddy
+rm -rf /var/lib/caddy/.local/share/caddy/locks/issue_cert_*
+sudo systemctl start caddy
+```
 
 ## License
 
