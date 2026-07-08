@@ -1,6 +1,8 @@
 # Release Notes
 
-## dev (current development)
+## v1.0.0 (2026-07-09)
+
+First stable release. Production-tested with wildcard and single-domain certificates, DynIP, and automatic renewal on ipv64.net.
 
 ### Breaking Changes
 - `propagation_delay_seconds` replaced by `propagation_timeout_seconds` + `propagation_poll_interval`
@@ -36,13 +38,13 @@
 | Cert renewal (emergency) | ~5s | 0 |
 | DynIP (IP unchanged) | 0 API calls | 0 |
 
-Install via xcaddy (development branch):
+Install via xcaddy:
 
 ```
-xcaddy build --with github.com/Sickjuicy/caddy-ipv64@dev
+xcaddy build --with github.com/Sickjuicy/caddy-ipv64@v1.0.0
 ```
 
-Built against Caddy v2.10.2, libdns v1.1.1.
+Built against Caddy v2.10.2, libdns v1.1.1, Go 1.25.
 
 ---
 
