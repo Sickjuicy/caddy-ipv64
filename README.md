@@ -8,7 +8,7 @@ Caddy v2 DNS provider module for [ipv64.net](https://ipv64.net) — DNS-01 ACME 
 
 - **DNS-01 ACME Challenges** — individual domains, wildcards, sub-subdomains
 - **Active DNS Propagation Checking** — polls resolvers instead of blind waiting (~25s vs 85s)
-- **DynDNS IP Updates** — automatic A/AAAA record creation with auto-detection
+- **DynDNS IP Updates** — automatic A/AAAA record updates via `nic/update` (in-place, no delete needed)
 - **DS-Lite Support** — auto-detects IPv6-only networks, or explicit `dslite` mode
 - **Automatic Renewal** — Caddy auto-renews expiring certificates using the same DNS-01 flow
 - **Multi-Subdomain DynIP** — update multiple subdomains in one config block
@@ -159,7 +159,7 @@ Caddy's `tls.cache.maintenance` monitors certificates and auto-renews at 1/3 rem
 1. Detect public IPv4/IPv6 via ipv64.net and ipify.org
 2. Auto-detect network mode (dual-stack / IPv4-only / DS-Lite)
 3. **Skip if IP unchanged** — no unnecessary API calls
-4. If changed: create A and/or AAAA records for each configured subdomain
+4. If changed: send a single `nic/update` request per subdomain — updates A and/or AAAA in-place (no delete/re-add)
 5. **Periodic force-update** every ~6h (12 cycles) — corrects external modifications even if local IP is unchanged
 6. Repeat at configured interval (default: 30 minutes)
 
@@ -185,8 +185,8 @@ This tests: build → cert obtain → automatic renewal → DynIP record creatio
 | Cert obtain (fast propagation) | ~25s | 2 (create + delete TXT) |
 | Cert renewal (emergency) | ~5s | 2 (create + delete TXT) |
 | DynIP (IP unchanged) | 0s | 0 (skipped) |
-| DynIP (IP changed) | <1s | 1 per subdomain |
-| DynIP (periodic force-update) | <1s | 1 per subdomain |
+| DynIP (IP changed) | <1s | 1 per subdomain (nic/update) |
+| DynIP (periodic force-update) | <1s | 1 per subdomain (nic/update) |
 
 ## Supported ipv64.net Services
 

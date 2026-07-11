@@ -14,6 +14,11 @@ import (
 	"go.uber.org/zap"
 )
 
+// dynipUpdaterEndpoint is the ipv64.net DynDNS2 update endpoint.
+// It performs an in-place update for A/AAAA records without requiring
+// a separate delete call. Supports Bearer token auth and explicit ip/ip6 params.
+const dynipUpdaterEndpoint = "https://ipv64.net/nic/update"
+
 // DynIPUpdater provides optional DynDNS IP update functionality.
 // It periodically creates/updates A and AAAA records on ipv64.net for one or
 // more subdomains by detecting the server's public IPv4 and IPv6 addresses.
@@ -40,11 +45,12 @@ type DynIPUpdater struct {
 	// Skips IPv4 detection entirely (DS-Lite users have no public IPv4).
 	DSLite bool `json:"dslite,omitempty"`
 
-	provider *Provider
-	logger   *zap.Logger
-	cancel   context.CancelFunc
-	lastIPv4 string
-	lastIPv6 string
+	provider        *Provider
+	logger          *zap.Logger
+	cancel          context.CancelFunc
+	lastIPv4        string
+	lastIPv6        string
+	updaterEndpoint string // overridden in tests
 	// autoDetected tracks whether the first-run auto-detection has happened.
 	autoDetected bool
 	// dsliteDetected is set by auto-detection when no IPv4 is available.
@@ -179,12 +185,14 @@ func (d *DynIPUpdater) updateIP(ctx context.Context) {
 	}
 
 	for _, sub := range d.Subdomains {
+		var ip4, ip6 string
 		if updateIPv4 {
-			d.setRecord(ctx, sub, "A", prevIPv4, ipv4)
+			ip4 = ipv4
 		}
 		if updateIPv6 {
-			d.setRecord(ctx, sub, "AAAA", prevIPv6, ipv6)
+			ip6 = ipv6
 		}
+		d.updateRecord(ctx, sub, ip4, ip6)
 	}
 
 	if updateIPv4 {
@@ -230,11 +238,13 @@ func (d *DynIPUpdater) fetchIP(ctx context.Context, url string) string {
 	return strings.TrimSpace(string(body))
 }
 
-// setRecord replaces an A or AAAA record on ipv64.net for the given subdomain.
-// The subdomain is split into managed zone + prefix for the ipv64.net API.
-// "example.ipv64.de" → zone="example.ipv64.de", prefix="@"
-// "vpn.example.ipv64.de" → zone="example.ipv64.de", prefix="vpn"
-func (d *DynIPUpdater) setRecord(ctx context.Context, subdomain, recordType, oldIP, newIP string) {
+// updateRecord updates A and/or AAAA records on ipv64.net for the given subdomain
+// using the DynDNS2 nic/update endpoint. A single GET request handles both IPv4
+// and IPv6 in one call — no delete needed, the endpoint performs an in-place update.
+//
+// "example.ipv64.de"     → domain="example.ipv64.de", praefix="@"
+// "vpn.example.ipv64.de" → domain="example.ipv64.de", praefix="vpn"
+func (d *DynIPUpdater) updateRecord(ctx context.Context, subdomain, ipv4, ipv6 string) {
 	managed := d.provider.deriveManagedZone(subdomain + ".")
 	if managed == "" {
 		d.logger.Error("ipv64 dynip: cannot derive managed zone", zap.String("subdomain", subdomain))
@@ -246,65 +256,51 @@ func (d *DynIPUpdater) setRecord(ctx context.Context, subdomain, recordType, old
 		prefix = strings.TrimSuffix(subdomain, "."+managed)
 	}
 
-	if oldIP != "" && oldIP != newIP {
-		if err := d.sendRecordAction(ctx, http.MethodDelete, "del_record", managed, prefix, recordType, oldIP); err != nil {
-			d.logger.Warn("ipv64 dynip: delete old record failed",
-				zap.String("subdomain", subdomain),
-				zap.String("type", recordType),
-				zap.String("old_ip", oldIP),
-				zap.Error(err))
-		} else {
-			d.logger.Info("ipv64 dynip: old record deleted",
-				zap.String("subdomain", subdomain),
-				zap.String("type", recordType),
-				zap.String("old_ip", oldIP))
-		}
+	params := url.Values{}
+	params.Set("domain", managed)
+	params.Set("praefix", prefix)
+	if ipv4 != "" {
+		params.Set("ip", ipv4)
+	}
+	if ipv6 != "" {
+		params.Set("ip6", ipv6)
 	}
 
-	if err := d.sendRecordAction(ctx, http.MethodPost, "add_record", managed, prefix, recordType, newIP); err != nil {
-		d.logger.Error("ipv64 dynip: set record failed",
-			zap.String("subdomain", subdomain),
-			zap.String("type", recordType),
-			zap.String("ip", newIP),
-			zap.Error(err))
+	endpoint := d.updaterEndpoint
+	if endpoint == "" {
+		endpoint = dynipUpdaterEndpoint
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint+"?"+params.Encode(), nil)
+	if err != nil {
+		d.logger.Error("ipv64 dynip: creating request", zap.Error(err))
 		return
 	}
-
-	d.logger.Info("ipv64 dynip: record set",
-		zap.String("subdomain", subdomain),
-		zap.String("type", recordType),
-		zap.String("ip", newIP))
-}
-
-func (d *DynIPUpdater) sendRecordAction(ctx context.Context, method, action, managed, prefix, recordType, ip string) error {
-	form := url.Values{}
-	form.Set(action, managed)
-	form.Set("praefix", prefix)
-	form.Set("type", recordType)
-	form.Set("content", ip)
-
-	req, err := http.NewRequestWithContext(ctx, method, d.provider.endpoint, strings.NewReader(form.Encode()))
-	if err != nil {
-		return fmt.Errorf("creating request: %w", err)
-	}
 	req.Header.Set("Authorization", "Bearer "+d.provider.Token)
-	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.Header.Set("User-Agent", "caddy-ipv64/dynip")
 
 	resp, err := d.provider.httpClient.Do(req)
 	if err != nil {
-		return fmt.Errorf("performing request: %w", err)
+		d.logger.Error("ipv64 dynip: update request failed",
+			zap.String("subdomain", subdomain),
+			zap.Error(err))
+		return
 	}
-	body, readErr := io.ReadAll(resp.Body)
+	body, _ := io.ReadAll(resp.Body)
 	resp.Body.Close()
-	if readErr != nil {
-		return fmt.Errorf("reading response: %w", readErr)
-	}
 
 	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
-		return nil
+		d.logger.Info("ipv64 dynip: record updated",
+			zap.String("subdomain", subdomain),
+			zap.String("ipv4", ipv4),
+			zap.String("ipv6", ipv6),
+			zap.String("response", strings.TrimSpace(string(body))))
+	} else {
+		d.logger.Warn("ipv64 dynip: update failed",
+			zap.String("subdomain", subdomain),
+			zap.String("status", resp.Status),
+			zap.String("body", strings.TrimSpace(string(body))))
 	}
-
-	return fmt.Errorf("ipv64 API error (status: %s): %s", resp.Status, strings.TrimSpace(string(body)))
 }
 
 func (d *DynIPUpdater) UnmarshalCaddyfile(d2 *caddyfile.Dispenser) error {

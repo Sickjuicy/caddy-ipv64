@@ -1,5 +1,38 @@
 # Release Notes
 
+## v1.0.2 (2026-07-11)
+
+### Improvements
+- **DynIP uses `nic/update` endpoint**: replaced delete+add approach with ipv64.net's DynDNS2 `nic/update` endpoint for true in-place record updates. Single GET request per subdomain instead of 2 API calls. IPv4 and IPv6 combined in one call for dual-stack.
+- Regression tests updated to verify single-call behavior and correct query params (`domain`, `praefix`, `ip`, `ip6`).
+
+Install via xcaddy:
+
+```
+xcaddy build --with github.com/Sickjuicy/caddy-ipv64@v1.0.2
+```
+
+Built against Caddy v2.11.4, libdns v1.1.1, Go 1.25.
+
+---
+
+## v1.0.1 (2026-07-11)
+
+### Bug Fixes
+- **DynIP duplicate-record fix**: IP changes no longer create duplicate DNS records. Old record is now deleted before adding the new one.
+- DynIP API requests now use properly encoded form payloads.
+- Regression tests added for delete-before-add sequence.
+
+Install via xcaddy:
+
+```
+xcaddy build --with github.com/Sickjuicy/caddy-ipv64@v1.0.1
+```
+
+Built against Caddy v2.11.4, libdns v1.1.1, Go 1.25.
+
+---
+
 ## v1.0.0 (2026-07-09)
 
 First stable release. Production-tested with wildcard and single-domain certificates, DynIP, and automatic renewal on ipv64.net.
