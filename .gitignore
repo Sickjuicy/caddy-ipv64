@@ -90,3 +90,4 @@ tests/Caddyfile.dynip-test
 tests/Caddyfile.lifecycle
 tests/make_short_cert.go
 tests/run-lifecycle-test.ps1
+.github/workflows/ci.yml
