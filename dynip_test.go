@@ -94,3 +94,27 @@ func TestDynIPUpdateRecord_ApexPrefix(t *testing.T) {
 	}
 }
 
+func TestDynIPUpdateRecord_UsesDynDNSAuth(t *testing.T) {
+	var gotAuth string
+	var gotQuery url.Values
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotAuth = r.Header.Get("Authorization")
+		gotQuery = r.URL.Query()
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"status":"success"}`))
+	}))
+	defer srv.Close()
+
+	p := &Provider{Token: "token", httpClient: srv.Client(), endpoint: srv.URL, logger: zap.NewNop()}
+	d := &DynIPUpdater{provider: p, logger: zap.NewNop(), updaterEndpoint: srv.URL}
+
+	d.updateRecord(context.Background(), "example.ipv64.de", "203.0.113.1", "")
+
+	if gotQuery.Get("key") != "token" {
+		t.Errorf("auth key: want token, got %q", gotQuery.Get("key"))
+	}
+	if gotAuth == "" {
+		t.Fatal("expected basic auth header to be set")
+	}
+}
+

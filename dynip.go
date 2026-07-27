@@ -259,6 +259,7 @@ func (d *DynIPUpdater) updateRecord(ctx context.Context, subdomain, ipv4, ipv6 s
 	params := url.Values{}
 	params.Set("domain", managed)
 	params.Set("praefix", prefix)
+	params.Set("key", d.provider.Token)
 	if ipv4 != "" {
 		params.Set("ip", ipv4)
 	}
@@ -276,7 +277,7 @@ func (d *DynIPUpdater) updateRecord(ctx context.Context, subdomain, ipv4, ipv6 s
 		d.logger.Error("ipv64 dynip: creating request", zap.Error(err))
 		return
 	}
-	req.Header.Set("Authorization", "Bearer "+d.provider.Token)
+	req.SetBasicAuth("none", d.provider.Token)
 	req.Header.Set("User-Agent", "caddy-ipv64/dynip")
 
 	resp, err := d.provider.httpClient.Do(req)
