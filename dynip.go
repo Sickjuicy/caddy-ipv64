@@ -63,6 +63,10 @@ type DynIPUpdater struct {
 	// = ~6h at 30m interval). This corrects cases where another tool or manual
 	// change overwrote the IP at ipv64.net while the local IP stayed the same.
 	forceUpdateEvery int
+	// DynIPToken is a dedicated updater token for ipv64.net DynDNS requests.
+	// It is used only for DynIP updates and does not replace the provider API token
+	// used for ACME/SSL operations.
+	DynIPToken string `json:"dynip_token,omitempty"`
 }
 
 func (d *DynIPUpdater) Provision(ctx caddy.Context, p *Provider) error {
@@ -259,7 +263,11 @@ func (d *DynIPUpdater) updateRecord(ctx context.Context, subdomain, ipv4, ipv6 s
 	params := url.Values{}
 	params.Set("domain", managed)
 	params.Set("praefix", prefix)
-	params.Set("key", d.provider.Token)
+	token := d.provider.Token
+	if d.DynIPToken != "" {
+		token = d.DynIPToken
+	}
+	params.Set("key", token)
 	if ipv4 != "" {
 		params.Set("ip", ipv4)
 	}
@@ -277,7 +285,7 @@ func (d *DynIPUpdater) updateRecord(ctx context.Context, subdomain, ipv4, ipv6 s
 		d.logger.Error("ipv64 dynip: creating request", zap.Error(err))
 		return
 	}
-	req.SetBasicAuth("none", d.provider.Token)
+	req.SetBasicAuth("none", token)
 	req.Header.Set("User-Agent", "caddy-ipv64/dynip")
 
 	resp, err := d.provider.httpClient.Do(req)

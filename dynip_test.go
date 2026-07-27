@@ -118,3 +118,27 @@ func TestDynIPUpdateRecord_UsesDynDNSAuth(t *testing.T) {
 	}
 }
 
+func TestDynIPUpdateRecord_UsesDynIPTokenOverride(t *testing.T) {
+	var gotUser, gotPass string
+	var gotQuery url.Values
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotUser, gotPass, _ = r.BasicAuth()
+		gotQuery = r.URL.Query()
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"status":"success"}`))
+	}))
+	defer srv.Close()
+
+	p := &Provider{Token: "provider-token", httpClient: srv.Client(), endpoint: srv.URL, logger: zap.NewNop()}
+	d := &DynIPUpdater{provider: p, logger: zap.NewNop(), updaterEndpoint: srv.URL, DynIPToken: "dynip-token"}
+
+	d.updateRecord(context.Background(), "example.ipv64.de", "203.0.113.1", "")
+
+	if gotQuery.Get("key") != "dynip-token" {
+		t.Errorf("auth key: want dynip-token, got %q", gotQuery.Get("key"))
+	}
+	if gotUser != "none" || gotPass != "dynip-token" {
+		t.Errorf("basic auth: want user=none pass=dynip-token, got user=%q pass=%q", gotUser, gotPass)
+	}
+}
+
