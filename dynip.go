@@ -242,7 +242,7 @@ func (d *DynIPUpdater) fetchIP(ctx context.Context, url string) string {
 // using the DynDNS2 nic/update endpoint. A single GET request handles both IPv4
 // and IPv6 in one call — no delete needed, the endpoint performs an in-place update.
 //
-// "example.ipv64.de"     → domain="example.ipv64.de", praefix="@"
+// "example.ipv64.de"     → domain="example.ipv64.de", praefix=""
 // "vpn.example.ipv64.de" → domain="example.ipv64.de", praefix="vpn"
 func (d *DynIPUpdater) updateRecord(ctx context.Context, subdomain, ipv4, ipv6 string) {
 	managed := d.provider.deriveManagedZone(subdomain + ".")
@@ -251,7 +251,7 @@ func (d *DynIPUpdater) updateRecord(ctx context.Context, subdomain, ipv4, ipv6 s
 		return
 	}
 
-	prefix := "@"
+	prefix := ""
 	if subdomain != managed {
 		prefix = strings.TrimSuffix(subdomain, "."+managed)
 	}

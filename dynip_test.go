@@ -61,8 +61,8 @@ func TestDynIPUpdateRecord_DualStack(t *testing.T) {
 	if got[0].Get("domain") != "example.ipv64.de" {
 		t.Errorf("domain: want example.ipv64.de, got %q", got[0].Get("domain"))
 	}
-	if got[0].Get("praefix") != "@" {
-		t.Errorf("praefix: want @, got %q", got[0].Get("praefix"))
+	if got[0].Get("praefix") != "" {
+		t.Errorf("praefix: want empty string, got %q", got[0].Get("praefix"))
 	}
 	if got[0].Get("ip") != "203.0.113.1" {
 		t.Errorf("ip: want 203.0.113.1, got %q", got[0].Get("ip"))
@@ -86,8 +86,8 @@ func TestDynIPUpdateRecord_ApexPrefix(t *testing.T) {
 
 	d.updateRecord(context.Background(), "example.ipv64.de", "203.0.113.1", "")
 
-	if got[0].Get("praefix") != "@" {
-		t.Errorf("apex praefix: want @, got %q", got[0].Get("praefix"))
+	if got[0].Get("praefix") != "" {
+		t.Errorf("apex prefix: want empty string, got %q", got[0].Get("praefix"))
 	}
 	if got[0].Get("domain") != "example.ipv64.de" {
 		t.Errorf("domain: want example.ipv64.de, got %q", got[0].Get("domain"))
