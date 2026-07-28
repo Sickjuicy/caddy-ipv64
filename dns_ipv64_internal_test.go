@@ -1,6 +1,16 @@
 package caddyipv64
 
-import "testing"
+import (
+	"context"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"net/url"
+	"testing"
+
+	"github.com/libdns/libdns"
+	"go.uber.org/zap"
+)
 
 // ---------------------------------------------------------------------------
 // isIpv64Domain
@@ -165,5 +175,72 @@ func TestValidate_WithToken(t *testing.T) {
 	p := &Provider{Token: "some-token"}
 	if err := p.Validate(); err != nil {
 		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestAppendAndDeleteRecords(t *testing.T) {
+	var got []struct {
+		method string
+		form   url.Values
+	}
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		values, err := url.ParseQuery(string(body))
+		if err != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		got = append(got, struct {
+			method string
+			form   url.Values
+		}{method: r.Method, form: values})
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"status":"success"}`))
+	}))
+	defer srv.Close()
+
+	p := &Provider{
+		Token:      "token",
+		httpClient: srv.Client(),
+		endpoint:   srv.URL,
+		logger:     zap.NewNop(),
+	}
+
+	_, err := p.AppendRecords(context.Background(), "ipv64.de", []libdns.Record{
+		libdns.RR{Name: "example", Type: "TXT", TTL: 300, Data: "v=spf1 include:_spf.example.com ~all"},
+	})
+	if err != nil {
+		t.Fatalf("AppendRecords returned error: %v", err)
+	}
+
+	_, err = p.DeleteRecords(context.Background(), "ipv64.de", []libdns.Record{
+		libdns.RR{Name: "example", Type: "TXT", TTL: 300, Data: "v=spf1 include:_spf.example.com ~all"},
+	})
+	if err != nil {
+		t.Fatalf("DeleteRecords returned error: %v", err)
+	}
+
+	if len(got) != 2 {
+		t.Fatalf("expected 2 API calls, got %d", len(got))
+	}
+	if got[0].method != http.MethodPost || got[1].method != http.MethodDelete {
+		t.Fatalf("unexpected methods: %s then %s", got[0].method, got[1].method)
+	}
+	if got[0].form.Get("add_record") != "example.ipv64.de" {
+		t.Fatalf("add_record zone mismatch: %q", got[0].form.Get("add_record"))
+	}
+	if got[1].form.Get("del_record") != "example.ipv64.de" {
+		t.Fatalf("del_record zone mismatch: %q", got[1].form.Get("del_record"))
+	}
+	if got[0].form.Get("type") != "TXT" {
+		t.Fatalf("add record type mismatch: %q", got[0].form.Get("type"))
+	}
+	if got[1].form.Get("type") != "TXT" {
+		t.Fatalf("delete record type mismatch: %q", got[1].form.Get("type"))
 	}
 }

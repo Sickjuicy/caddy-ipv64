@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"net/url"
 	"strings"
 	"time"
 
@@ -63,10 +62,6 @@ type DynIPUpdater struct {
 	// = ~6h at 30m interval). This corrects cases where another tool or manual
 	// change overwrote the IP at ipv64.net while the local IP stayed the same.
 	forceUpdateEvery int
-	// DynIPToken is a dedicated updater token for ipv64.net DynDNS requests.
-	// It is used only for DynIP updates and does not replace the provider API token
-	// used for ACME/SSL operations.
-	DynIPToken string `json:"dynip_token,omitempty"`
 }
 
 func (d *DynIPUpdater) Provision(ctx caddy.Context, p *Provider) error {
@@ -196,7 +191,7 @@ func (d *DynIPUpdater) updateIP(ctx context.Context) {
 		if updateIPv6 {
 			ip6 = ipv6
 		}
-		d.updateRecord(ctx, sub, ip4, ip6)
+		d.updateRecord(ctx, sub, prevIPv4, prevIPv6, ip4, ip6)
 	}
 
 	if updateIPv4 {
@@ -243,12 +238,11 @@ func (d *DynIPUpdater) fetchIP(ctx context.Context, url string) string {
 }
 
 // updateRecord updates A and/or AAAA records on ipv64.net for the given subdomain
-// using the DynDNS2 nic/update endpoint. A single GET request handles both IPv4
-// and IPv6 in one call — no delete needed, the endpoint performs an in-place update.
+// through the authenticated ipv64.net API.
 //
-// "example.ipv64.de"     → domain="example.ipv64.de", praefix=""
-// "vpn.example.ipv64.de" → domain="example.ipv64.de", praefix="vpn"
-func (d *DynIPUpdater) updateRecord(ctx context.Context, subdomain, ipv4, ipv6 string) {
+// "example.ipv64.de"     → zone="example.ipv64.de", prefix=""
+// "vpn.example.ipv64.de" → zone="example.ipv64.de", prefix="vpn"
+func (d *DynIPUpdater) updateRecord(ctx context.Context, subdomain, oldIPv4, oldIPv6, newIPv4, newIPv6 string) {
 	managed := d.provider.deriveManagedZone(subdomain + ".")
 	if managed == "" {
 		d.logger.Error("ipv64 dynip: cannot derive managed zone", zap.String("subdomain", subdomain))
@@ -260,56 +254,41 @@ func (d *DynIPUpdater) updateRecord(ctx context.Context, subdomain, ipv4, ipv6 s
 		prefix = strings.TrimSuffix(subdomain, "."+managed)
 	}
 
-	params := url.Values{}
-	params.Set("domain", managed)
-	params.Set("praefix", prefix)
-	token := d.provider.Token
-	if d.DynIPToken != "" {
-		token = d.DynIPToken
+	var errs []error
+	if oldIPv4 != "" && oldIPv4 != newIPv4 {
+		if err := d.provider.apiCall(ctx, http.MethodDelete, "del_record", managed, prefix, "A", oldIPv4); err != nil {
+			errs = append(errs, fmt.Errorf("delete A record: %w", err))
+		}
 	}
-	params.Set("key", token)
-	if ipv4 != "" {
-		params.Set("ip", ipv4)
+	if oldIPv6 != "" && oldIPv6 != newIPv6 {
+		if err := d.provider.apiCall(ctx, http.MethodDelete, "del_record", managed, prefix, "AAAA", oldIPv6); err != nil {
+			errs = append(errs, fmt.Errorf("delete AAAA record: %w", err))
+		}
 	}
-	if ipv6 != "" {
-		params.Set("ip6", ipv6)
+	if newIPv4 != "" {
+		if err := d.provider.apiCall(ctx, http.MethodPost, "add_record", managed, prefix, "A", newIPv4); err != nil {
+			errs = append(errs, fmt.Errorf("create A record: %w", err))
+		}
+	}
+	if newIPv6 != "" {
+		if err := d.provider.apiCall(ctx, http.MethodPost, "add_record", managed, prefix, "AAAA", newIPv6); err != nil {
+			errs = append(errs, fmt.Errorf("create AAAA record: %w", err))
+		}
 	}
 
-	endpoint := d.updaterEndpoint
-	if endpoint == "" {
-		endpoint = dynipUpdaterEndpoint
-	}
-
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint+"?"+params.Encode(), nil)
-	if err != nil {
-		d.logger.Error("ipv64 dynip: creating request", zap.Error(err))
-		return
-	}
-	req.SetBasicAuth("none", token)
-	req.Header.Set("User-Agent", "caddy-ipv64/dynip")
-
-	resp, err := d.provider.httpClient.Do(req)
-	if err != nil {
-		d.logger.Error("ipv64 dynip: update request failed",
-			zap.String("subdomain", subdomain),
-			zap.Error(err))
-		return
-	}
-	body, _ := io.ReadAll(resp.Body)
-	resp.Body.Close()
-
-	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
-		d.logger.Info("ipv64 dynip: record updated",
-			zap.String("subdomain", subdomain),
-			zap.String("ipv4", ipv4),
-			zap.String("ipv6", ipv6),
-			zap.String("response", strings.TrimSpace(string(body))))
-	} else {
+	if len(errs) > 0 {
 		d.logger.Warn("ipv64 dynip: update failed",
 			zap.String("subdomain", subdomain),
-			zap.String("status", resp.Status),
-			zap.String("body", strings.TrimSpace(string(body))))
+			zap.String("ipv4", newIPv4),
+			zap.String("ipv6", newIPv6),
+			zap.Error(errs[0]))
+		return
 	}
+
+	d.logger.Info("ipv64 dynip: record updated",
+		zap.String("subdomain", subdomain),
+		zap.String("ipv4", newIPv4),
+		zap.String("ipv6", newIPv6))
 }
 
 func (d *DynIPUpdater) UnmarshalCaddyfile(d2 *caddyfile.Dispenser) error {

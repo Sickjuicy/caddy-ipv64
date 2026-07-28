@@ -165,7 +165,7 @@ func (p *Provider) AppendRecords(ctx context.Context, zone string, recs []libdns
 
 		prefix := p.computePrefix(fqdn, managed)
 
-		if err := p.apiCall(ctx, http.MethodPost, "add_record", managed, prefix, rr.Data); err != nil {
+		if err := p.apiCall(ctx, http.MethodPost, "add_record", managed, prefix, "TXT", rr.Data); err != nil {
 			return appended, err
 		}
 		appended = append(appended, r)
@@ -196,7 +196,7 @@ func (p *Provider) DeleteRecords(ctx context.Context, zone string, recs []libdns
 
 		prefix := p.computePrefix(fqdn, managed)
 
-		if err := p.apiCall(ctx, http.MethodDelete, "del_record", managed, prefix, rr.Data); err != nil {
+		if err := p.apiCall(ctx, http.MethodDelete, "del_record", managed, prefix, "TXT", rr.Data); err != nil {
 			p.logger.Warn("ipv64: failed to delete DNS record (may already be gone)", zap.Error(err), zap.String("fqdn", fqdn))
 		} else {
 			p.logger.Info("ipv64: DNS record deleted", zap.String("fqdn", fqdn), zap.String("zone", managed))
@@ -217,11 +217,11 @@ func (p *Provider) SetRecords(ctx context.Context, zone string, recs []libdns.Re
 // --- API client ---
 
 // apiCall sends a form-encoded request to the ipv64.net API with retry logic.
-func (p *Provider) apiCall(ctx context.Context, method, action, zone, prefix, content string) error {
+func (p *Provider) apiCall(ctx context.Context, method, action, zone, prefix, recordType, content string) error {
 	form := url.Values{}
 	form.Set(action, zone)
 	form.Set("praefix", prefix)
-	form.Set("type", "TXT")
+	form.Set("type", recordType)
 	form.Set("content", content)
 
 	var lastErr error
