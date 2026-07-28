@@ -1,5 +1,21 @@
 # Release Notes
 
+## v1.0.4 (2026-07-28)
+
+### Bug Fixes
+- **DynIP updater auth fixed**: adjusted the DynIP update flow for ipv64.net so record updates use the expected authenticated API path.
+- **Regression tests added**: covered DNS add/delete record requests and DynIP update behavior to prevent regressions.
+
+Install via xcaddy:
+
+```
+xcaddy build --with github.com/Sickjuicy/caddy-ipv64@v1.0.4
+```
+
+Built against Caddy v2.11.4, libdns v1.1.1, Go 1.25.
+
+---
+
 ## v1.0.2 (2026-07-11)
 
 ### Improvements
